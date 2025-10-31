@@ -396,19 +396,14 @@ class BackupManager:
         
         try:
             logger.info(f"Processing {source_config.type} source: {source_config.name}")
-            
-            # Get last backup timestamp for incremental backup
-            last_backup_time = self._get_last_backup_timestamp(source_config.name, destination_config)
-            
+
             # Handle OneDrive sources
             if source_config.type == 'onedrive_personal':
                 results = await self._process_onedrive_source(
-                    source_config, destination_config, job_config, last_backup_time
-                )
+                    source_config, destination_config, job_config)
             elif source_config.type == 'sharepoint':
                 results = await self._process_sharepoint_source(
-                    source_config, destination_config, job_config, last_backup_time
-                )
+                    source_config, destination_config, job_config)
             else:
                 logger.warning(f"Unsupported source type: {source_config.type}")
                 results['errors'].append(f"Unsupported source type: {source_config.type}")
@@ -427,15 +422,13 @@ class BackupManager:
         
         return results
     
-    async def _process_onedrive_source(self, source_config, destination_config, job_config,
-                                      last_backup_time: Optional[str] = None) -> Dict[str, Any]:
+    async def _process_onedrive_source(self, source_config, destination_config, job_config) -> Dict[str, Any]:
         """Process OneDrive personal source with incremental backup support.
         
         Args:
             source_config: OneDrive source configuration
             destination_config: Destination configuration
             job_config: Job configuration
-            last_backup_time: ISO timestamp of last backup (None for full backup)
             
         Returns:
             Dictionary with processing results
@@ -452,18 +445,7 @@ class BackupManager:
             'bytes_transferred': 0,
             'errors': []
         }
-        
-        # Parse last backup time for comparison
-        last_backup_dt = None
-        if last_backup_time:
-            try:
-                last_backup_dt = date_parser.parse(last_backup_time)
-                logger.info(f"🔄 Incremental backup: Only files modified after {last_backup_time}")
-            except Exception as e:
-                logger.warning(f"Failed to parse last backup time: {e} - performing full backup")
-        else:
-            logger.info(f"📦 Full backup: No previous backup found")
-        
+      
         try:
             # Initialize OneDrive file manager
             onedrive_manager = OneDriveFileManager(self.microsoft_auth)
@@ -541,13 +523,16 @@ class BackupManager:
                     fallback_timestamp = delta_info.get('last_backup_time') if delta_info else None
                     
                     # Stream files using Delta API (with hybrid fallback)
-                    new_delta_token = None
                     async for file_info in self._stream_onedrive_files_delta(
                         user_info['id'], headers, user_prefix, delta_token_url, fallback_timestamp
                     ):
-                        # Capture the new delta token from the last iteration
+                        # Capture and IMMEDIATELY save the new delta token
                         if isinstance(file_info, dict) and file_info.get('_delta_token'):
                             new_delta_token = file_info['_delta_token']
+                            # ✅ Save immediately to allow resume if interrupted
+                            if not getattr(job_config, 'dry_run', False):
+                                self._save_delta_token(source_config.name, user_info['id'], new_delta_token, destination_config)
+                                logger.info(f"✅ Saved delta token (backup can resume from this point if interrupted)")
                             continue
                         try:
                             results['files_processed'] += 1
@@ -595,11 +580,6 @@ class BackupManager:
                             error_msg = f"Error processing file {file_info.get('name', 'unknown')}: {str(e)}"
                             results['errors'].append(error_msg)
                             logger.error(error_msg)
-                    
-                    # Save the new delta token for next backup
-                    if new_delta_token and not getattr(job_config, 'dry_run', False):
-                        self._save_delta_token(source_config.name, user_info['id'], new_delta_token, destination_config)
-                        logger.info(f"✅ Saved delta token for next incremental backup")
                 
                 except Exception as e:
                     error_msg = f"Error processing OneDrive for {user_info.get('name', 'unknown')}: {str(e)}"
@@ -612,15 +592,13 @@ class BackupManager:
         
         return results
     
-    async def _process_sharepoint_source(self, source_config, destination_config, job_config,
-                                        last_backup_time: Optional[str] = None) -> Dict[str, Any]:
+    async def _process_sharepoint_source(self, source_config, destination_config, job_config) -> Dict[str, Any]:
         """Process SharePoint source with incremental backup support.
         
         Args:
             source_config: SharePoint source configuration
             destination_config: Destination configuration
             job_config: Job configuration
-            last_backup_time: ISO timestamp of last backup (None for full backup)
             
         Returns:
             Dictionary with processing results
@@ -636,17 +614,7 @@ class BackupManager:
             'errors': []
         }
         
-        # Parse last backup time
-        last_backup_dt = None
-        if last_backup_time:
-            try:
-                last_backup_dt = date_parser.parse(last_backup_time)
-                logger.info(f"🔄 Incremental backup: Only files modified after {last_backup_time}")
-            except Exception as e:
-                logger.warning(f"Failed to parse last backup time: {e} - performing full backup")
-        else:
-            logger.info(f"📦 Full backup: No previous backup found")
-        
+       
         try:
             # Get access token
             token = self.microsoft_auth.get_access_token()
@@ -684,13 +652,16 @@ class BackupManager:
                 fallback_timestamp = delta_info.get('last_backup_time') if delta_info else None
                 
                 # Stream files using Delta API (with hybrid fallback)
-                new_delta_token = None
                 async for file_info in self._stream_sharepoint_files_delta(
                     drive_id, headers, drive_name, delta_token_url, fallback_timestamp
                 ):
-                    # Capture the new delta token from the last iteration
+                    # Capture and IMMEDIATELY save the new delta token
                     if isinstance(file_info, dict) and file_info.get('_delta_token'):
                         new_delta_token = file_info['_delta_token']
+                        # ✅ Save immediately to allow resume if interrupted
+                        if not getattr(job_config, 'dry_run', False):
+                            self._save_delta_token(source_config.name, drive_id, new_delta_token, destination_config)
+                            logger.info(f"✅ Saved delta token for {drive_name} (backup can resume from this point if interrupted)")
                         continue
                     try:
                         results['files_processed'] += 1
@@ -743,11 +714,6 @@ class BackupManager:
                         error_msg = f"Error processing file {file_info.get('name', 'unknown')}: {str(e)}"
                         results['errors'].append(error_msg)
                         logger.error(error_msg)
-                
-                # Save the new delta token for next backup
-                if new_delta_token and not getattr(job_config, 'dry_run', False):
-                    self._save_delta_token(source_config.name, drive_id, new_delta_token, destination_config)
-                    logger.info(f"✅ Saved delta token for drive {drive_name}")
             
         except Exception as e:
             error_msg = f"Error processing SharePoint source {source_config.name}: {str(e)}"

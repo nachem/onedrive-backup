@@ -1,3 +1,4 @@
 logs/
 __pycache__/
-credentials.yaml
+build/
+config/credentials.yaml
