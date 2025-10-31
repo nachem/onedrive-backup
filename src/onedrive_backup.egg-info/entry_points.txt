@@ -1,0 +1,2 @@
+[console_scripts]
+onedrive-backup = onedrive_backup.cli:cli

@@ -1,0 +1,139 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug OneDrive Backup - Dry Run",
+            "type": "python",
+            "request": "launch",
+            "module": "src.onedrive_backup.cli",
+            "args": [
+                "backup",
+                "--job", "onedrive_backup",
+                "--dry-run"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            }
+        },
+        {
+            "name": "Debug SharePoint Backup - Dry Run",
+            "type": "python",
+            "request": "launch",
+            "module": "src.onedrive_backup.cli",
+            "args": [
+                "backup",
+                "--job", "sharepoint_backup",
+                "--dry-run"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            }
+        },
+        {
+            "name": "Debug OneDrive Backup - Real Upload",
+            "type": "python",
+            "request": "launch",
+            "module": "src.onedrive_backup.cli",
+            "args": [
+                "backup",
+                "--job", "onedrive_backup"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            }
+        },
+        {
+            "name": "Debug SharePoint Backup - Real Upload",
+            "type": "python",
+            "request": "launch",
+            "module": "src.onedrive_backup.cli",
+            "args": [
+                "backup",
+                "--job", "sharepoint_backup"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            }
+        },
+        {
+            "name": "Debug Test Connections",
+            "type": "python",
+            "request": "launch",
+            "module": "src.onedrive_backup.cli",
+            "args": [
+                "test"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            }
+        },
+        {
+            "name": "Debug List OneDrive Files",
+            "type": "python",
+            "request": "launch",
+            "module": "src.onedrive_backup.cli",
+            "args": [
+                "list-onedrive-files",
+                "--user", "maayan@bernoulli.tech",
+                "--recursive"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            }
+        },
+        {
+            "name": "Debug All Backup Jobs",
+            "type": "python",
+            "request": "launch",
+            "module": "src.onedrive_backup.cli",
+            "args": [
+                "backup",
+                "--dry-run"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            }
+        },
+        {
+            "name": "Debug Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            }
+        }
+    ]
+}
