@@ -1,12 +1,17 @@
 """Microsoft Graph authentication handling."""
 
-import os
 import json
-from typing import Optional, Dict, Any
+import logging
+import os
+import time
 from pathlib import Path
+from typing import Any, Dict, Optional
+
 import msal
-from azure.identity import ClientSecretCredential, InteractiveBrowserCredential
 import requests
+from azure.identity import ClientSecretCredential, InteractiveBrowserCredential
+
+logger = logging.getLogger(__name__)
 
 class MicrosoftGraphAuth:
     """Handle authentication for Microsoft Graph API."""
@@ -38,6 +43,7 @@ class MicrosoftGraphAuth:
             ]
         
         self._access_token: Optional[str] = None
+        self._token_expiry: Optional[float] = None  # Unix timestamp when token expires
         self._app: Optional[msal.ClientApplication] = None
     
     def _get_msal_app(self) -> msal.ClientApplication:
@@ -113,14 +119,45 @@ class MicrosoftGraphAuth:
         
         if "access_token" in result:
             self._access_token = result["access_token"]
+            
+            # Store token expiry time (with buffer for safety)
+            # MSAL typically returns tokens valid for 3600 seconds (1 hour)
+            expires_in = result.get("expires_in", 3600)
+            self._token_expiry = time.time() + expires_in
+            
+            logger.info(f"✅ Obtained new access token (expires in {expires_in} seconds)")
             self._save_token_cache()
             return self._access_token
         else:
             error_msg = result.get("error_description", result.get("error", "Unknown authentication error"))
             raise Exception(f"Authentication failed: {error_msg}")
     
+    def _is_token_expired(self) -> bool:
+        """Check if the current access token is expired or about to expire.
+        
+        Returns:
+            True if token is expired or will expire within 5 minutes
+        """
+        if self._access_token is None or self._token_expiry is None:
+            return True
+        
+        # Add 5-minute buffer before expiry
+        buffer_seconds = 300
+        current_time = time.time()
+        
+        is_expired = current_time >= (self._token_expiry - buffer_seconds)
+        
+        if is_expired:
+            time_left = self._token_expiry - current_time
+            logger.warning(f"⚠️ Access token expired or expiring soon (time left: {time_left:.0f}s)")
+        
+        return is_expired
+    
     def get_access_token(self, force_refresh: bool = False) -> str:
-        """Get current access token, refreshing if necessary.
+        """Get current access token, automatically refreshing if expired.
+        
+        This method implements automatic token refresh to prevent HTTP 401 errors
+        during long-running backup operations.
         
         Args:
             force_refresh: Force token refresh even if current token seems valid
@@ -128,8 +165,44 @@ class MicrosoftGraphAuth:
         Returns:
             Access token string
         """
-        if self._access_token is None or force_refresh:
-            return self.authenticate(use_interactive=False)
+        # Check if token needs refresh
+        if force_refresh or self._is_token_expired():
+            if self._access_token is not None and not force_refresh:
+                logger.info("🔄 Access token expired, refreshing automatically...")
+            
+            # Try silent refresh first using MSAL's token cache
+            app = self._get_msal_app()
+            accounts = app.get_accounts()
+            
+            if accounts:
+                result = app.acquire_token_silent(self.scopes, account=accounts[0])
+                if result and "access_token" in result:
+                    self._access_token = result["access_token"]
+                    expires_in = result.get("expires_in", 3600)
+                    self._token_expiry = time.time() + expires_in
+                    logger.info(f"✅ Token refreshed automatically (expires in {expires_in}s)")
+                    self._save_token_cache()
+                    return self._access_token
+            
+            # If silent refresh failed, try full authentication
+            if self.app_secret:
+                # For confidential clients, use client credentials
+                result = app.acquire_token_for_client(scopes=self.scopes)
+                if "access_token" in result:
+                    self._access_token = result["access_token"]
+                    expires_in = result.get("expires_in", 3600)
+                    self._token_expiry = time.time() + expires_in
+                    logger.info(f"✅ Token refreshed via client credentials (expires in {expires_in}s)")
+                    self._save_token_cache()
+                    return self._access_token
+                else:
+                    error = result.get("error_description", "Unknown error")
+                    logger.error(f"❌ Failed to refresh token: {error}")
+                    raise Exception(f"Token refresh failed: {error}")
+            else:
+                # For public clients, need to re-authenticate interactively
+                logger.warning("⚠️ Token expired and cannot refresh automatically (interactive login required)")
+                return self.authenticate(use_interactive=False)
         
         return self._access_token
     
