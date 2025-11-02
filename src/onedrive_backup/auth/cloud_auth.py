@@ -1,11 +1,12 @@
 """Cloud storage authentication handling."""
 
-import os
-import boto3
-from azure.storage.blob import BlobServiceClient
-from azure.identity import DefaultAzureCredential
-from typing import Optional, Dict, Any
 import logging
+import os
+from typing import Any, Dict, Optional
+
+import boto3
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,8 @@ class AWSAuth:
         access_key_id: Optional[str] = None,
         secret_access_key: Optional[str] = None,
         session_token: Optional[str] = None,
-        region: str = "us-east-1"
+        region: str = "us-east-1",
+        force_refresh_on_401: bool = True
     ):
         """Initialize AWS authentication.
         
@@ -26,22 +28,28 @@ class AWSAuth:
             secret_access_key: AWS secret access key
             session_token: AWS session token (for temporary credentials)
             region: AWS region
+            force_refresh_on_401: Automatically recreate client on 401 errors
         """
         self.access_key_id = access_key_id
         self.secret_access_key = secret_access_key
         self.session_token = session_token
         self.region = region
+        self.force_refresh_on_401 = force_refresh_on_401
         self._s3_client = None
+        self._use_default_chain = not (access_key_id and secret_access_key)
     
-    def get_s3_client(self):
-        """Get authenticated S3 client.
+    def get_s3_client(self, force_refresh: bool = False):
+        """Get authenticated S3 client with automatic credential refresh.
+        
+        Args:
+            force_refresh: Force recreation of the client (useful for credential refresh)
         
         Returns:
             boto3 S3 client
         """
-        if self._s3_client is None:
+        if self._s3_client is None or force_refresh:
             # Use provided credentials or fall back to default credential chain
-            if self.access_key_id and self.secret_access_key:
+            if not self._use_default_chain:
                 self._s3_client = boto3.client(
                     's3',
                     aws_access_key_id=self.access_key_id,
@@ -49,11 +57,23 @@ class AWSAuth:
                     aws_session_token=self.session_token,
                     region_name=self.region
                 )
+                logger.debug("Created S3 client with explicit credentials")
             else:
                 # Use default credential chain (environment, instance profile, etc.)
+                # This automatically refreshes credentials for IAM roles
                 self._s3_client = boto3.client('s3', region_name=self.region)
+                logger.debug("Created S3 client using default credential chain")
         
         return self._s3_client
+    
+    def refresh_credentials(self):
+        """Force refresh of S3 client credentials.
+        
+        This is useful when credentials expire during long-running operations.
+        """
+        logger.info("Refreshing AWS S3 credentials...")
+        self._s3_client = None
+        return self.get_s3_client(force_refresh=True)
     
     def test_connection(self, bucket_name: str) -> bool:
         """Test S3 connection by checking if bucket is accessible.
