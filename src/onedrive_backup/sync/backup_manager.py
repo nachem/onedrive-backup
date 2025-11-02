@@ -3,6 +3,10 @@
 import asyncio
 import json
 import logging
+import os
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -10,9 +14,127 @@ from typing import Any, Dict, List, Optional
 from ..auth.cloud_auth import AWSAuth, AzureAuth
 from ..auth.microsoft_auth import MicrosoftGraphAuth
 from ..config.settings import BackupConfig, BackupJobConfig
-
+import time
 # Module logger
 logger = logging.getLogger(__name__)
+
+
+# Sentinel value to signal end of queue
+_SENTINEL = object()
+times = 0
+class FileQueueManager:
+    """Thread-safe manager for file download/upload queue."""
+    
+    def __init__(self, max_workers: int = 5):
+        """Initialize queue manager.
+        
+        Args:
+            max_workers: Maximum number of parallel workers
+        """
+        # Set queue size to max_workers + 1 to limit memory usage
+        self.file_queue: queue.Queue = queue.Queue(maxsize=max_workers*2)
+        self.results_lock = threading.Lock()
+        self.max_workers = max_workers
+        self.stop_event = threading.Event()
+        self.times = 0
+        # Statistics tracking
+        self.files_processed = 0
+        self.files_uploaded = 0
+        self.files_skipped = 0
+        self.bytes_transferred = 0
+        self.errors = []
+    
+    def add_file(self, file_info: Dict[str, Any], timeout: Optional[float] = None) -> bool:
+        """Add file to processing queue. Blocks if queue is full.
+        
+        Args:
+            file_info: File information dictionary
+            timeout: Maximum time to wait if queue is full
+            
+        Returns:
+            True if file was added, False if timeout occurred
+        """
+        try:
+            # Block with timeout to avoid deadlock
+            self.file_queue.put(file_info, block=True, timeout=timeout)
+            return True
+        except queue.Full:
+            logger.warning(f"Queue full, waiting to add: {file_info.get('name', 'unknown')}")
+            # Retry with longer timeout
+            try:
+                self.file_queue.put(file_info, block=True, timeout=timeout * 2)
+                return True
+            except queue.Full:
+                logger.error(f"Failed to add file to queue after {timeout * 3}s: {file_info.get('name', 'unknown')}")
+                return False
+    
+    def get_next_file(self, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Get next file from queue (thread-safe).
+        
+        Args:
+            timeout: Timeout in seconds
+            
+        Returns:
+            File info dict, _SENTINEL to signal end, or None if queue is empty
+        """
+        try:
+            
+            item = self.file_queue.get(timeout=timeout)
+            return item
+        except queue.Empty:
+            return None
+    
+    def signal_done(self):
+        """Signal that no more files will be added by sending sentinel values."""
+        for _ in range(self.max_workers):
+            self.file_queue.put(_SENTINEL)
+    
+    def mark_processed(self):
+        """Mark current file as processed."""
+        self.file_queue.task_done()
+    
+    def update_stats(self, uploaded: bool = False, skipped: bool = False, 
+                    bytes_transferred: int = 0, error: Optional[str] = None):
+        """Update statistics (thread-safe).
+        
+        Args:
+            uploaded: Whether file was uploaded
+            skipped: Whether file was skipped
+            bytes_transferred: Bytes transferred
+            error: Error message if any
+        """
+        with self.results_lock:
+            self.files_processed += 1
+            if uploaded:
+                self.files_uploaded += 1
+                self.bytes_transferred += bytes_transferred
+            if skipped:
+                self.files_skipped += 1
+            if error:
+                self.errors.append(error)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current statistics (thread-safe).
+        
+        Returns:
+            Statistics dictionary
+        """
+        with self.results_lock:
+            return {
+                'files_processed': self.files_processed,
+                'files_uploaded': self.files_uploaded,
+                'files_skipped': self.files_skipped,
+                'bytes_transferred': self.bytes_transferred,
+                'errors': self.errors.copy()
+            }
+    
+    def stop(self):
+        """Signal workers to stop."""
+        self.stop_event.set()
+    
+    def should_stop(self) -> bool:
+        """Check if workers should stop."""
+        return self.stop_event.is_set()
 
 
 class BackupManager:
@@ -28,6 +150,9 @@ class BackupManager:
         self.microsoft_auth: Optional[MicrosoftGraphAuth] = None
         self.aws_auth: Optional[AWSAuth] = None
         self.azure_auth: Optional[AzureAuth] = None
+        
+        # Parallel processing configuration
+        self.max_parallel_workers = getattr(config, 'max_parallel_workers', 20)
         
         # Setup logging using proper utility
         self._setup_logging()
@@ -311,7 +436,7 @@ class BackupManager:
         except Exception as e:
             logger.error(f"Failed to save backup metadata: {e}")
     
-    async def run_backup_job(self, job_config: BackupJobConfig) -> Dict[str, Any]:
+    def run_backup_job(self, job_config: BackupJobConfig) -> Dict[str, Any]:
         """Run a single backup job.
         
         Args:
@@ -349,7 +474,7 @@ class BackupManager:
                     continue
                 
                 logger.info(f"Processing source: {source_name}")
-                source_results = await self._process_source(source, destination, job_config)
+                source_results = self._process_source(source, destination, job_config)
                 
                 # Aggregate results
                 results['files_processed'] += source_results.get('files_processed', 0)
@@ -372,7 +497,7 @@ class BackupManager:
         
         return results
     
-    async def _process_source(self, source_config, destination_config, job_config) -> Dict[str, Any]:
+    def _process_source(self, source_config, destination_config, job_config) -> Dict[str, Any]:
         """Process a single source configuration.
         
         Args:
@@ -399,10 +524,10 @@ class BackupManager:
 
             # Handle OneDrive sources
             if source_config.type == 'onedrive_personal':
-                results = await self._process_onedrive_source(
+                results = self._process_onedrive_source(
                     source_config, destination_config, job_config)
             elif source_config.type == 'sharepoint':
-                results = await self._process_sharepoint_source(
+                results = self._process_sharepoint_source(
                     source_config, destination_config, job_config)
             else:
                 logger.warning(f"Unsupported source type: {source_config.type}")
@@ -422,8 +547,77 @@ class BackupManager:
         
         return results
     
-    async def _process_onedrive_source(self, source_config, destination_config, job_config) -> Dict[str, Any]:
-        """Process OneDrive personal source with incremental backup support.
+    def _parallel_upload_worker(self, queue_manager: FileQueueManager, 
+                                destination_config, job_config, worker_id: int):
+        """Worker thread that processes files from queue.
+        
+        Args:
+            queue_manager: Thread-safe queue manager
+            destination_config: Destination configuration
+            job_config: Job configuration
+            worker_id: Worker thread ID
+        """
+        logger.info(f"Worker {worker_id} started")
+        
+        while not queue_manager.should_stop():
+            file_info = queue_manager.get_next_file(timeout=10.0)
+            
+            if file_info is None:
+                logger.info(f"Worker {worker_id} timed out waiting for file, checking again...")
+                break
+            
+            # Check for sentinel value signaling end of queue
+            if file_info is _SENTINEL:
+                logger.info(f"Worker {worker_id} received sentinel, exiting")
+                break
+            
+            try:
+                file_path = file_info.get('path', file_info.get('name', ''))
+                file_size = file_info.get('size', 0)
+                modified_time = file_info.get('lastModifiedDateTime', '')
+                
+                # Check if file already exists in S3 with same modification time
+                if self._check_s3_file_exists(destination_config, file_path, modified_time):
+                    logger.info(f"⏭️ [Worker {worker_id}] Skipping (already backed up): {file_path}")
+                    queue_manager.update_stats(skipped=True)
+                    continue
+                
+                # For dry run
+                if getattr(job_config, 'dry_run', False):
+                    logger.info(f"[DRY RUN] [Worker {worker_id}] Would upload: {file_path} ({file_size:,} bytes)")
+                    queue_manager.update_stats(uploaded=True, bytes_transferred=file_size)
+                    continue
+                
+                # Download and upload file
+                download_url = file_info.get('@microsoft.graph.downloadUrl', '')
+                
+                if not download_url:
+                    error_msg = f"No download URL for {file_path}"
+                    logger.error(f"[Worker {worker_id}] {error_msg}")
+                    queue_manager.update_stats(error=error_msg)
+                    continue
+                
+                logger.info(f"[Worker {worker_id}] Uploading: {file_path} ({file_size:,} bytes)")
+                
+                upload_result = self._stream_upload_file(file_info, download_url, destination_config)
+                
+                if upload_result.get('success', False):
+                    queue_manager.update_stats(uploaded=True, bytes_transferred=file_size)
+                    logger.info(f"✅ [Worker {worker_id}] Uploaded: {file_path}")
+                else:
+                    error_msg = f"Upload failed for {file_path}: {upload_result.get('error')}"
+                    logger.error(f"[Worker {worker_id}] {error_msg}")
+                    queue_manager.update_stats(error=error_msg)
+                
+            except Exception as e:
+                error_msg = f"Error processing file {file_info.get('name', 'unknown')}: {str(e)}"
+                logger.error(f"[Worker {worker_id}] {error_msg}")
+                queue_manager.update_stats(error=error_msg)
+        
+        logger.debug(f"Worker {worker_id} stopped")
+    
+    def _process_onedrive_source(self, source_config, destination_config, job_config) -> Dict[str, Any]:
+        """Process OneDrive personal source with parallel incremental backup support.
         
         Args:
             source_config: OneDrive source configuration
@@ -450,12 +644,16 @@ class BackupManager:
             # Initialize OneDrive file manager
             onedrive_manager = OneDriveFileManager(self.microsoft_auth)
             
-            # Get access token
-            token = self.microsoft_auth.get_access_token()
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json'
-            }
+            # Get access token - use a method that returns fresh headers
+            def get_fresh_headers():
+                """Get fresh headers with current token."""
+                token = self.microsoft_auth.get_access_token()
+                return {
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/json'
+                }
+            
+            headers = get_fresh_headers()
             
             # Get all users with OneDrive
             logger.info(f"Discovering users with OneDrive for: {source_config.name}")
@@ -511,10 +709,11 @@ class BackupManager:
                 logger.info(f"Processing all {len(users_with_onedrive)} users")
                 users_to_process = users_with_onedrive
             
-            # Process each user's OneDrive
+            # Process each user's OneDrive with parallel workers
             for user_info in users_to_process:
                 try:
                     logger.info(f"Processing OneDrive for: {user_info['name']} ({user_info['email']})")
+                    logger.info(f"Using {self.max_parallel_workers} parallel workers")
                     user_prefix = user_info['email'].split('@')[0]
                     
                     # Get delta token and timestamp for this user
@@ -522,64 +721,65 @@ class BackupManager:
                     delta_token_url = delta_info.get('delta_token') if delta_info else None
                     fallback_timestamp = delta_info.get('last_backup_time') if delta_info else None
                     
-                    # Stream files using Delta API (with hybrid fallback)
-                    async for file_info in self._stream_onedrive_files_delta(
-                        user_info['id'], headers, user_prefix, delta_token_url, fallback_timestamp
-                    ):
-                        # Capture and IMMEDIATELY save the new delta token
-                        if isinstance(file_info, dict) and file_info.get('_delta_token'):
-                            new_delta_token = file_info['_delta_token']
-                            # ✅ Save immediately to allow resume if interrupted
-                            if not getattr(job_config, 'dry_run', False):
-                                self._save_delta_token(source_config.name, user_info['id'], new_delta_token, destination_config)
-                                logger.info(f"✅ Saved delta token (backup can resume from this point if interrupted)")
-                            continue
-                        try:
-                            results['files_processed'] += 1
-                            
-                            file_path = file_info.get('path', file_info.get('name', ''))
-                            file_size = file_info.get('size', 0)
-                            modified_time = file_info.get('lastModifiedDateTime', '')
-                            
-                            # Check if file already exists in S3 with same modification time
-                            if self._check_s3_file_exists(destination_config, file_path, modified_time):
-                                logger.info(f"⏭️ Skipping (already backed up): {file_path}")
-                                results['files_skipped'] += 1
+                    # Create queue manager for this user
+                    queue_manager = FileQueueManager(max_workers=self.max_parallel_workers)
+                    
+                    # Start worker threads
+                    with ThreadPoolExecutor(max_workers=self.max_parallel_workers) as executor:
+                        # Submit worker tasks
+                        worker_futures = [
+                            executor.submit(
+                                self._parallel_upload_worker,
+                                queue_manager,
+                                destination_config,
+                                job_config,
+                                i
+                            )
+                            for i in range(self.max_parallel_workers)
+                        ]
+                        logger.info(f"Started {self.max_parallel_workers} worker threads for {user_info['name']}")
+                        # files = 0
+                        # Producer: Stream files from Delta API and add to queue
+                        for file_info in self._stream_onedrive_files_delta(
+                            user_info['id'], headers, user_prefix, delta_token_url, fallback_timestamp
+                        ):
+                            # logger.info(f"Producer received file: {file_info.get('name', 'unknown')}")
+                            # files += 1
+                            # if files > 10:
+                            #     break
+                            # Capture and IMMEDIATELY save the new delta token
+                            if isinstance(file_info, dict) and file_info.get('_delta_token'):
+                                new_delta_token = file_info['_delta_token']
+                                # ✅ Save immediately to allow resume if interrupted
+                                if not getattr(job_config, 'dry_run', False):
+                                    self._save_delta_token(source_config.name, user_info['id'], new_delta_token, destination_config)
+                                    logger.info(f"✅ Saved delta token (backup can resume from this point if interrupted)")
                                 continue
                             
-                            # For dry run, just count
-                            if getattr(job_config, 'dry_run', False):
-                                logger.info(f"[DRY RUN] Would upload: {file_path} ({file_size:,} bytes)")
-                                results['files_uploaded'] += 1
-                                results['bytes_transferred'] += file_size
-                                continue
-                            
-                            # Upload the file
-                            logger.info(f"Uploading: {file_path} ({file_size:,} bytes)")
-                            download_url = file_info.get('@microsoft.graph.downloadUrl', '')
-                            
-                            if download_url:
-                                upload_result = await self._stream_upload_file(
-                                    file_info, download_url, destination_config
-                                )
-                                
-                                if upload_result.get('success', False):
-                                    results['files_uploaded'] += 1
-                                    results['bytes_transferred'] += file_size
-                                    logger.info(f"✅ Uploaded: {file_path}")
-                                else:
-                                    error_msg = f"Upload failed for {file_path}: {upload_result.get('error')}"
-                                    results['errors'].append(error_msg)
-                                    logger.error(error_msg)
-                            else:
-                                error_msg = f"No download URL for {file_path}"
-                                results['errors'].append(error_msg)
-                                logger.error(error_msg)
+                            # Add file to queue - run in executor to avoid blocking async loop
+                            queue_manager.add_file(file_info)
+                        logger.info(f"Producer finished adding files for {user_info['name']}")
+                        # Producer finished - signal workers that no more files are coming
+                        logger.debug(f"Producer finished for {user_info['name']}, sending sentinel values")
+                        queue_manager.signal_done()
                         
-                        except Exception as e:
-                            error_msg = f"Error processing file {file_info.get('name', 'unknown')}: {str(e)}"
-                            results['errors'].append(error_msg)
-                            logger.error(error_msg)
+                        # Wait for all workers to complete
+                        for future in as_completed(worker_futures):
+                            try:
+                                future.result()
+                            except Exception as e:
+                                logger.error(f"Worker thread error: {e}")
+                    
+                    # Aggregate results from queue manager
+                    user_stats = queue_manager.get_stats()
+                    results['files_processed'] += user_stats['files_processed']
+                    results['files_uploaded'] += user_stats['files_uploaded']
+                    results['files_skipped'] += user_stats['files_skipped']
+                    results['bytes_transferred'] += user_stats['bytes_transferred']
+                    results['errors'].extend(user_stats['errors'])
+                    
+                    logger.info(f"Completed {user_info['name']}: {user_stats['files_uploaded']} uploaded, "
+                               f"{user_stats['files_skipped']} skipped, {user_stats['files_processed']} total")
                 
                 except Exception as e:
                     error_msg = f"Error processing OneDrive for {user_info.get('name', 'unknown')}: {str(e)}"
@@ -592,8 +792,8 @@ class BackupManager:
         
         return results
     
-    async def _process_sharepoint_source(self, source_config, destination_config, job_config) -> Dict[str, Any]:
-        """Process SharePoint source with incremental backup support.
+    def _process_sharepoint_source(self, source_config, destination_config, job_config) -> Dict[str, Any]:
+        """Process SharePoint source with parallel incremental backup support.
         
         Args:
             source_config: SharePoint source configuration
@@ -639,81 +839,78 @@ class BackupManager:
             drives = drives_response.json().get('value', [])
             logger.info(f"Found {len(drives)} SharePoint drives")
             
-            # Process each drive
+            # Process each drive with parallel workers
             for drive in drives:
                 drive_name = drive.get('name', 'Unknown')
                 drive_id = drive.get('id')
                 
                 logger.info(f"Processing drive: {drive_name}")
+                logger.info(f"Using {self.max_parallel_workers} parallel workers")
                 
                 # Get delta token and timestamp for this drive
                 delta_info = self._get_delta_token(source_config.name, drive_id, destination_config)
                 delta_token_url = delta_info.get('delta_token') if delta_info else None
                 fallback_timestamp = delta_info.get('last_backup_time') if delta_info else None
                 
-                # Stream files using Delta API (with hybrid fallback)
-                async for file_info in self._stream_sharepoint_files_delta(
-                    drive_id, headers, drive_name, delta_token_url, fallback_timestamp
-                ):
-                    # Capture and IMMEDIATELY save the new delta token
-                    if isinstance(file_info, dict) and file_info.get('_delta_token'):
-                        new_delta_token = file_info['_delta_token']
-                        # ✅ Save immediately to allow resume if interrupted
-                        if not getattr(job_config, 'dry_run', False):
-                            self._save_delta_token(source_config.name, drive_id, new_delta_token, destination_config)
-                            logger.info(f"✅ Saved delta token for {drive_name} (backup can resume from this point if interrupted)")
-                        continue
-                    try:
-                        results['files_processed'] += 1
-                        
-                        file_path = file_info.get('path', file_info.get('name', ''))
-                        file_size = file_info.get('size', 0)
-                        modified_time = file_info.get('lastModifiedDateTime', '')
-                        
-                        # Full path including drive name for S3
-                        full_s3_path = f"{drive_name}/{file_path}"
-                        
-                        # Check if file already exists in S3 with same modification time
-                        if self._check_s3_file_exists(destination_config, full_s3_path, modified_time):
-                            logger.info(f"⏭️ Skipping (already backed up): {full_s3_path}")
-                            results['files_skipped'] += 1
-                            continue
-                        
-                        # For dry run
-                        if getattr(job_config, 'dry_run', False):
-                            logger.info(f"[DRY RUN] Would upload: {full_s3_path} ({file_size:,} bytes)")
-                            results['files_uploaded'] += 1
-                            results['bytes_transferred'] += file_size
-                            continue
-                        
-                        # Upload file
-                        download_url = file_info.get('@microsoft.graph.downloadUrl', '')
-                        if download_url:
-                            logger.info(f"Uploading: {full_s3_path} ({file_size:,} bytes)")
-                            
-                            upload_result = await self._stream_upload_file(
-                                {**file_info, 'path': full_s3_path},
-                                download_url,
-                                destination_config
-                            )
-                            
-                            if upload_result.get('success', False):
-                                results['files_uploaded'] += 1
-                                results['bytes_transferred'] += file_size
-                                logger.info(f"✅ Uploaded: {full_s3_path}")
-                            else:
-                                error_msg = f"Upload failed for {file_path}: {upload_result.get('error')}"
-                                results['errors'].append(error_msg)
-                                logger.error(error_msg)
-                        else:
-                            error_msg = f"No download URL for {file_path}"
-                            results['errors'].append(error_msg)
-                            logger.error(error_msg)
+                # Create queue manager for this drive
+                queue_manager = FileQueueManager(max_workers=self.max_parallel_workers)
+                
+                # Start worker threads
+                with ThreadPoolExecutor(max_workers=self.max_parallel_workers) as executor:
+                    # Submit worker tasks
+                    worker_futures = [
+                        executor.submit(
+                            self._parallel_upload_worker,
+                            queue_manager,
+                            destination_config,
+                            job_config,
+                            i
+                        )
+                        for i in range(self.max_parallel_workers)
+                    ]
                     
-                    except Exception as e:
-                        error_msg = f"Error processing file {file_info.get('name', 'unknown')}: {str(e)}"
-                        results['errors'].append(error_msg)
-                        logger.error(error_msg)
+                    # Producer: Stream files from Delta API and add to queue
+                    for file_info in self._stream_sharepoint_files_delta(
+                        drive_id, headers, drive_name, delta_token_url, fallback_timestamp
+                    ):
+                        # Capture and IMMEDIATELY save the new delta token
+                        if isinstance(file_info, dict) and file_info.get('_delta_token'):
+                            new_delta_token = file_info['_delta_token']
+                            # ✅ Save immediately to allow resume if interrupted
+                            if not getattr(job_config, 'dry_run', False):
+                                self._save_delta_token(source_config.name, drive_id, new_delta_token, destination_config)
+                                logger.info(f"✅ Saved delta token for {drive_name} (backup can resume from this point if interrupted)")
+                            continue
+                        
+                        # Add full S3 path including drive name
+                        file_path = file_info.get('path', file_info.get('name', ''))
+                        full_s3_path = f"{drive_name}/{file_path}"
+                        file_info_with_full_path = {**file_info, 'path': full_s3_path}
+                        
+                        # Add file to queue - run in executor to avoid blocking async loop
+                        queue_manager.add_file(file_info_with_full_path)
+                    
+                    # Producer finished - signal workers that no more files are coming
+                    logger.debug(f"Producer finished for {drive_name}, sending sentinel values")
+                    queue_manager.signal_done()
+                    
+                    # Wait for all workers to complete
+                    for future in as_completed(worker_futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logger.error(f"Worker thread error: {e}")
+                
+                # Aggregate results from queue manager
+                drive_stats = queue_manager.get_stats()
+                results['files_processed'] += drive_stats['files_processed']
+                results['files_uploaded'] += drive_stats['files_uploaded']
+                results['files_skipped'] += drive_stats['files_skipped']
+                results['bytes_transferred'] += drive_stats['bytes_transferred']
+                results['errors'].extend(drive_stats['errors'])
+                
+                logger.info(f"Completed {drive_name}: {drive_stats['files_uploaded']} uploaded, "
+                           f"{drive_stats['files_skipped']} skipped, {drive_stats['files_processed']} total")
             
         except Exception as e:
             error_msg = f"Error processing SharePoint source {source_config.name}: {str(e)}"
@@ -722,7 +919,7 @@ class BackupManager:
         
         return results
     
-    async def _stream_onedrive_files_delta(self, user_id: str, headers: Dict[str, str],
+    def _stream_onedrive_files_delta(self, user_id: str, headers: Dict[str, str],
                                            user_prefix: str = "", delta_token: Optional[str] = None,
                                            fallback_timestamp: Optional[str] = None):
         """Stream files from OneDrive using Delta API with timestamp fallback.
@@ -757,7 +954,24 @@ class BackupManager:
             files_found = 0
             
             while endpoint:
+                # Refresh headers before each request to ensure fresh token
+                token = self.microsoft_auth.get_access_token()
+                headers = {
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/json'
+                }
+                
                 response = requests.get(endpoint, headers=headers)
+                
+                # Handle 401 errors by forcing token refresh and retrying
+                if response.status_code == 401:
+                    logger.info(f"🔄 Token expired, refreshing and retrying delta request...")
+                    token = self.microsoft_auth.get_access_token(force_refresh=True)
+                    headers = {
+                        'Authorization': f'Bearer {token}',
+                        'Content-Type': 'application/json'
+                    }
+                    response = requests.get(endpoint, headers=headers)
                 
                 # Handle delta token expiration
                 if response.status_code == 410:
@@ -770,7 +984,7 @@ class BackupManager:
                             logger.info(f"📅 Falling back to timestamp filter: files modified after {fallback_timestamp}")
                             
                             # Use recursive method with timestamp filtering
-                            async for file_info in self._stream_onedrive_files_recursive(
+                            for file_info in self._stream_onedrive_files_recursive(
                                 user_id, headers, folder_id='root', user_prefix=user_prefix,
                                 modified_after=fallback_dt
                             ):
@@ -848,15 +1062,36 @@ class BackupManager:
                         # If no download URL, fetch it separately
                         if not download_url and item_id:
                             try:
+                                # Use existing headers (don't refresh token unless needed)
                                 item_response = requests.get(
                                     f'https://graph.microsoft.com/v1.0/users/{user_id}/drive/items/{item_id}',
                                     headers=headers
                                 )
+                                
+                                # Handle 401 by refreshing token
+                                if item_response.status_code == 401:
+                                    logger.debug(f"Token expired, refreshing for {name}")
+                                    token = self.microsoft_auth.get_access_token(force_refresh=True)
+                                    headers['Authorization'] = f'Bearer {token}'
+                                    item_response = requests.get(
+                                        f'https://graph.microsoft.com/v1.0/users/{user_id}/drive/items/{item_id}',
+                                        headers=headers
+                                    )
+                                
                                 if item_response.status_code == 200:
                                     item_data = item_response.json()
                                     download_url = item_data.get('@microsoft.graph.downloadUrl', '')
+                                    
+                                    # Some files legitimately have no download URL (system files, zero-byte files)
+                                    if not download_url:
+                                        file_size = item.get('size', 0)
+                                        # Only log warning for non-zero files
+                                        if file_size > 0:
+                                            logger.debug(f"No download URL for {name} ({file_size} bytes) - may be restricted")
+                                else:
+                                    logger.debug(f"Failed to fetch metadata: HTTP {item_response.status_code} for {name}")
                             except Exception as e:
-                                logger.warning(f"Failed to get download URL for {name}: {e}")
+                                logger.debug(f"Exception fetching download URL for {name}: {e}")
                         
                         yield {
                             'id': item_id,
@@ -888,7 +1123,7 @@ class BackupManager:
         except Exception as e:
             logger.error(f"Error in delta API streaming: {e}")
     
-    async def _stream_onedrive_files_recursive(self, user_id: str, headers: Dict[str, str],
+    def _stream_onedrive_files_recursive(self, user_id: str, headers: Dict[str, str],
                                                folder_id: str = "root", user_prefix: str = "",
                                                path: str = "", depth: int = 0, max_depth: int = 10,
                                                modified_after: Optional[datetime] = None):
@@ -942,7 +1177,7 @@ class BackupManager:
                     
                     if item.get('folder'):
                         # Recursively process subdirectories
-                        async for file_info in self._stream_onedrive_files_recursive(
+                        for file_info in self._stream_onedrive_files_recursive(
                             user_id, headers, item_id, user_prefix, full_path, depth + 1, max_depth,
                             modified_after
                         ):
@@ -974,7 +1209,7 @@ class BackupManager:
                         full_path_with_user = f"{user_prefix}/{full_path}"
                         
                         if item.get('folder'):
-                            async for file_info in self._stream_onedrive_files_recursive(
+                            for file_info in self._stream_onedrive_files_recursive(
                                 user_id, headers, item_id, user_prefix, full_path, depth + 1, max_depth,
                                 modified_after
                             ):
@@ -1001,7 +1236,7 @@ class BackupManager:
         except Exception as e:
             logger.error(f"Error listing OneDrive folder for user {user_id}: {e}")
     
-    async def _stream_sharepoint_files_delta(self, drive_id: str, headers: Dict[str, str],
+    def _stream_sharepoint_files_delta(self, drive_id: str, headers: Dict[str, str],
                                              drive_name: str = "", delta_token: Optional[str] = None,
                                              fallback_timestamp: Optional[str] = None):
         """Stream files from SharePoint using Delta API with timestamp fallback.
@@ -1036,7 +1271,24 @@ class BackupManager:
             files_found = 0
             
             while endpoint:
+                # Refresh headers before each request to ensure fresh token
+                token = self.microsoft_auth.get_access_token()
+                headers = {
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/json'
+                }
+                
                 response = requests.get(endpoint, headers=headers)
+                
+                # Handle 401 errors by forcing token refresh and retrying
+                if response.status_code == 401:
+                    logger.info(f"🔄 Token expired, refreshing and retrying delta request...")
+                    token = self.microsoft_auth.get_access_token(force_refresh=True)
+                    headers = {
+                        'Authorization': f'Bearer {token}',
+                        'Content-Type': 'application/json'
+                    }
+                    response = requests.get(endpoint, headers=headers)
                 
                 # Handle delta token expiration
                 if response.status_code == 410:
@@ -1049,7 +1301,7 @@ class BackupManager:
                             logger.info(f"📅 Falling back to timestamp filter: files modified after {fallback_timestamp}")
                             
                             # Use recursive method with timestamp filtering
-                            async for file_info in self._stream_sharepoint_files_recursive(
+                            for file_info in self._stream_sharepoint_files_recursive(
                                 drive_id, headers, folder_id='root', path="",
                                 modified_after=fallback_dt
                             ):
@@ -1123,18 +1375,37 @@ class BackupManager:
                         # Get download URL (delta API doesn't always include it)
                         download_url = item.get('@microsoft.graph.downloadUrl', '')
                         
-                        # If no download URL, fetch it separately
+                        # If no download URL, fetch it separately with retry logic
                         if not download_url and item_id:
                             try:
                                 item_response = requests.get(
                                     f'https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}',
                                     headers=headers
                                 )
+                                
+                                # Handle 401 by refreshing token
+                                if item_response.status_code == 401:
+                                    logger.debug(f"Token expired, refreshing for {name}")
+                                    token = self.microsoft_auth.get_access_token(force_refresh=True)
+                                    headers['Authorization'] = f'Bearer {token}'
+                                    item_response = requests.get(
+                                        f'https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}',
+                                        headers=headers
+                                    )
+                                
                                 if item_response.status_code == 200:
                                     item_data = item_response.json()
                                     download_url = item_data.get('@microsoft.graph.downloadUrl', '')
+                                    
+                                    # Some files legitimately have no download URL
+                                    if not download_url:
+                                        file_size = item.get('size', 0)
+                                        if file_size > 0:
+                                            logger.debug(f"No download URL for {name} ({file_size} bytes) - may be restricted")
+                                else:
+                                    logger.debug(f"Failed to fetch metadata: HTTP {item_response.status_code} for {name}")
                             except Exception as e:
-                                logger.warning(f"Failed to get download URL for {name}: {e}")
+                                logger.debug(f"Exception fetching download URL for {name}: {e}")
                         
                         yield {
                             'id': item_id,
@@ -1166,7 +1437,7 @@ class BackupManager:
         except Exception as e:
             logger.error(f"Error in SharePoint delta API streaming: {e}")
     
-    async def _stream_sharepoint_files_recursive(self, drive_id: str, headers: Dict[str, str],
+    def _stream_sharepoint_files_recursive(self, drive_id: str, headers: Dict[str, str],
                                                  folder_id: str = "root", path: str = "", 
                                                  depth: int = 0, max_depth: int = 10,
                                                  modified_after: Optional[datetime] = None):
@@ -1217,7 +1488,7 @@ class BackupManager:
                     
                     if item.get('folder'):
                         # Recursively process subdirectories
-                        async for file_info in self._stream_sharepoint_files_recursive(
+                        for file_info in self._stream_sharepoint_files_recursive(
                             drive_id, headers, item_id, full_path, depth + 1, max_depth,
                             modified_after
                         ):
@@ -1248,7 +1519,7 @@ class BackupManager:
                         full_path = f"{path}/{name}" if path else name
                         
                         if item.get('folder'):
-                            async for file_info in self._stream_sharepoint_files_recursive(
+                            for file_info in self._stream_sharepoint_files_recursive(
                                 drive_id, headers, item_id, full_path, depth + 1, max_depth,
                                 modified_after
                             ):
@@ -1275,7 +1546,7 @@ class BackupManager:
         except Exception as e:
             logger.error(f"Error listing SharePoint folder: {e}")
     
-    async def _stream_upload_file(self, file_info: Dict[str, Any], download_url: str, 
+    def _stream_upload_file(self, file_info: Dict[str, Any], download_url: str, 
                                  destination_config) -> Dict[str, Any]:
         """Stream upload a file to destination.
         
@@ -1293,7 +1564,7 @@ class BackupManager:
             content_type = file_info.get('mimeType', 'application/octet-stream')
             
             if destination_config.type == 'aws_s3':
-                return await self._stream_to_aws_s3(
+                return self._stream_to_aws_s3(
                     file_path, download_url, file_size, content_type, destination_config, file_info
                 )
             else:
@@ -1308,7 +1579,7 @@ class BackupManager:
                 'error': f"Stream upload error: {str(e)}"
             }
     
-    async def _stream_to_aws_s3(self, file_path: str, download_url: str, file_size: int, 
+    def _stream_to_aws_s3(self, file_path: str, download_url: str, file_size: int, 
                                content_type: str, destination_config, 
                                file_info: Dict[str, Any] = None) -> Dict[str, Any]:
         """Stream file to AWS S3.
@@ -1374,7 +1645,7 @@ class BackupManager:
                 'error': f"AWS S3 upload error: {str(e)}"
             }
     
-    async def run_all_jobs(self) -> List[Dict[str, Any]]:
+    def run_all_jobs(self) -> List[Dict[str, Any]]:
         """Run all enabled backup jobs.
         
         Returns:
@@ -1385,7 +1656,7 @@ class BackupManager:
         
         results = []
         for job in enabled_jobs:
-            job_result = await self.run_backup_job(job)
+            job_result = self.run_backup_job(job)
             results.append(job_result)
         
         return results
