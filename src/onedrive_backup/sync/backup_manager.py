@@ -55,6 +55,7 @@ class FileQueueManager:
             True if file was added, False if timeout occurred
         """
         try:
+            logger.info(f"Adding file to queue: {file_info.get('name', 'unknown')}")
             # Block with timeout to avoid deadlock
             self.file_queue.put(file_info, block=True, timeout=timeout)
             return True
@@ -103,15 +104,15 @@ class FileQueueManager:
             bytes_transferred: Bytes transferred
             error: Error message if any
         """
-        with self.results_lock:
-            self.files_processed += 1
-            if uploaded:
-                self.files_uploaded += 1
-                self.bytes_transferred += bytes_transferred
-            if skipped:
-                self.files_skipped += 1
-            if error:
-                self.errors.append(error)
+        # with self.results_lock:
+        self.files_processed += 1
+        if uploaded:
+            self.files_uploaded += 1
+            self.bytes_transferred += bytes_transferred
+        if skipped:
+            self.files_skipped += 1
+        if error:
+            self.errors.append(error)
     
     def get_stats(self) -> Dict[str, Any]:
         """Get current statistics (thread-safe).
@@ -571,7 +572,7 @@ class BackupManager:
         logger.info(f"Worker {worker_id} started")
         
         while not queue_manager.should_stop():
-            file_info = queue_manager.get_next_file(timeout=10.0)
+            file_info = queue_manager.get_next_file(timeout=40.0)
             
             if file_info is None:
                 logger.info(f"Worker {worker_id} timed out waiting for file, checking again...")
@@ -589,7 +590,7 @@ class BackupManager:
                 
                 # Check if file already exists in S3 with same modification time
                 if self._check_s3_file_exists(destination_config, file_path, modified_time):
-                    logger.info(f"⏭️ [Worker {worker_id}] Skipping (already backed up): {file_path}")
+                    # logger.info(f"⏭️ [Worker {worker_id}] Skipping (already backed up): {file_path}")
                     queue_manager.update_stats(skipped=True)
                     continue
                 
@@ -965,16 +966,30 @@ class BackupManager:
             files_found = 0
             
             while endpoint:
+                logger.info(f"Fetching delta page: {endpoint}")
                 # Refresh headers before each request to ensure fresh token
                 token = self.microsoft_auth.get_access_token()
                 headers = {
                     'Authorization': f'Bearer {token}',
                     'Content-Type': 'application/json'
                 }
-                
                 response = requests.get(endpoint, headers=headers)
+                logger.info(f"got response: {response.status_code}...")
                 
-                
+                # Handle 429 errors by implementing exponential backoff
+                if response.status_code == 429:
+                    logger.warning(f"⚠️ Rate limit exceeded for user {user_id[:8]}...")
+                    retry_delay = 1  # Start with 1 second
+                    max_retries = 5
+                    for retry in range(max_retries):
+                        logger.info(f"⏳ Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        response = requests.get(endpoint, headers=headers)
+                        if response.status_code == 200:
+                            break
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        logger.error(f"❌ Rate limit exceeded after {max_retries} retries for {file_path}")
                 # Handle 401 errors by forcing token refresh and retrying
                 if response.status_code == 401:    
                     logger.info(f"🔄 Token expired, refreshing and retrying delta request...")
@@ -984,7 +999,7 @@ class BackupManager:
                         'Content-Type': 'application/json'
                     }
                     response = requests.get(endpoint, headers=headers)
-                
+                    
                 # Handle delta token expiration
                 if response.status_code == 410 :
                     logger.warning(f"⚠️ Delta token expired for user {user_id[:8]}...")
@@ -1583,19 +1598,66 @@ class BackupManager:
             
             if needs_auth:
                 # Get fresh token for download (handles token expiration)
-                token = self.microsoft_auth.get_access_token()
-                headers = {'Authorization': f'Bearer {token}'}
-                response = requests.get(download_url, headers=headers, stream=True)
+                # Retry with exponential backoff for rate limiting (429) and auth errors (401)
+                max_retries = 5
+                retry_delay = 1  # Start with 1 second
                 
-                # Handle 401 by refreshing token and retrying
-                if response.status_code == 401:
-                    logger.debug(f"Microsoft Graph token expired during download, refreshing...")
-                    token = self.microsoft_auth.get_access_token(force_refresh=True)
+                for attempt in range(max_retries):
+                    token = self.microsoft_auth.get_access_token()
                     headers = {'Authorization': f'Bearer {token}'}
                     response = requests.get(download_url, headers=headers, stream=True)
+                    
+                    if response.status_code == 200:
+                        break  # Success
+                    elif response.status_code == 401:
+                        logger.debug(f"Microsoft Graph token expired during download, refreshing...")
+                        token = self.microsoft_auth.get_access_token(force_refresh=True)
+                        headers = {'Authorization': f'Bearer {token}'}
+                        response = requests.get(download_url, headers=headers, stream=True)
+                        if response.status_code == 200:
+                            break
+                    elif response.status_code == 429:
+                        # Rate limited - check Retry-After header
+                        retry_after = response.headers.get('Retry-After', str(retry_delay))
+                        try:
+                            wait_time = int(retry_after)
+                        except ValueError:
+                            wait_time = retry_delay
+                        
+                        if attempt < max_retries - 1:
+                            logger.warning(f"⚠️ Rate limited (429) downloading {file_path}, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                            time.sleep(wait_time)
+                            retry_delay = min(retry_delay * 2, 60)  # Exponential backoff, max 60s
+                        else:
+                            logger.error(f"❌ Rate limit exceeded after {max_retries} retries for {file_path}")
+                    else:
+                        break  # Other error, don't retry
             else:
                 # Pre-authenticated download URL (no auth needed)
-                response = requests.get(download_url, stream=True)
+                # Still handle 429 rate limiting
+                max_retries = 5
+                retry_delay = 1
+                
+                for attempt in range(max_retries):
+                    response = requests.get(download_url, stream=True)
+                    
+                    if response.status_code == 200:
+                        break
+                    elif response.status_code == 429:
+                        retry_after = response.headers.get('Retry-After', str(retry_delay))
+                        try:
+                            wait_time = int(retry_after)
+                        except ValueError:
+                            wait_time = retry_delay
+                        
+                        if attempt < max_retries - 1:
+                            logger.warning(f"⚠️ Rate limited (429) downloading {file_path}, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                            time.sleep(wait_time)
+                            retry_delay = min(retry_delay * 2, 60)
+                        else:
+                            logger.error(f"❌ Rate limit exceeded after {max_retries} retries for {file_path}")
+                    else:
+                        break
             
             if response.status_code == 200:
                 encoded_path = base64.b64encode(file_path.encode('utf-8')).decode('ascii')
