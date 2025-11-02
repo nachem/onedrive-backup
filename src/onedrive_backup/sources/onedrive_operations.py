@@ -1,12 +1,13 @@
 """OneDrive operations for listing and managing files."""
 
-import requests
-from typing import List, Dict, Optional, Any
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
 from rich.tree import Tree
-from rich import print as rprint
 
 from ..auth.microsoft_auth import MicrosoftGraphAuth
 
@@ -20,13 +21,15 @@ class OneDriveFileManager:
         """Initialize with Microsoft Graph authentication."""
         self.auth = auth
         self.headers = None
+        self.token = None
         
     def _get_headers(self) -> Dict[str, str]:
         """Get authentication headers."""
-        if not self.headers:
-            token = self.auth.get_access_token()
+        token = self.auth.get_access_token()
+        if not self.headers or token != self.token:
+            self.token = token
             self.headers = {
-                'Authorization': f'Bearer {token}',
+                'Authorization': f'Bearer {self.token}',
                 'Content-Type': 'application/json'
             }
         return self.headers
