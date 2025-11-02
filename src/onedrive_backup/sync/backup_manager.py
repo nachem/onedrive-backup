@@ -6,6 +6,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any, Dict, List, Optional
 from ..auth.cloud_auth import AWSAuth, AzureAuth
 from ..auth.microsoft_auth import MicrosoftGraphAuth
 from ..config.settings import BackupConfig, BackupJobConfig
-import time
+
 # Module logger
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,6 @@ class FileQueueManager:
         self.results_lock = threading.Lock()
         self.max_workers = max_workers
         self.stop_event = threading.Event()
-        self.times = 0
         # Statistics tracking
         self.files_processed = 0
         self.files_uploaded = 0
@@ -362,11 +362,22 @@ class BackupManager:
             prefix = getattr(destination_config, 'prefix', '')
             s3_key = f"{prefix}{file_path}".lstrip('/')
             
-            # Try to get object metadata
-            response = s3_client.head_object(
-                Bucket=destination_config.bucket,
-                Key=s3_key
-            )
+            # Try to get object metadata with retry on 401
+            try:
+                response = s3_client.head_object(
+                    Bucket=destination_config.bucket,
+                    Key=s3_key
+                )
+            except s3_client.exceptions.ClientError as e:
+                if e.response['Error']['Code'] == '401' or e.response['Error']['Code'] == 'ExpiredToken':
+                    logger.info(f"AWS credentials expired, refreshing...")
+                    s3_client = self.aws_auth.refresh_credentials()
+                    response = s3_client.head_object(
+                        Bucket=destination_config.bucket,
+                        Key=s3_key
+                    )
+                else:
+                    raise
             
             # Check if modification time matches
             existing_modified = response.get('Metadata', {}).get('source-modified-time', '')
@@ -918,7 +929,7 @@ class BackupManager:
             results['errors'].append(error_msg)
         
         return results
-    
+    times = 0
     def _stream_onedrive_files_delta(self, user_id: str, headers: Dict[str, str],
                                            user_prefix: str = "", delta_token: Optional[str] = None,
                                            fallback_timestamp: Optional[str] = None):
@@ -963,8 +974,9 @@ class BackupManager:
                 
                 response = requests.get(endpoint, headers=headers)
                 
+                
                 # Handle 401 errors by forcing token refresh and retrying
-                if response.status_code == 401:
+                if response.status_code == 401:    
                     logger.info(f"🔄 Token expired, refreshing and retrying delta request...")
                     token = self.microsoft_auth.get_access_token(force_refresh=True)
                     headers = {
@@ -974,7 +986,7 @@ class BackupManager:
                     response = requests.get(endpoint, headers=headers)
                 
                 # Handle delta token expiration
-                if response.status_code == 410:
+                if response.status_code == 410 :
                     logger.warning(f"⚠️ Delta token expired for user {user_id[:8]}...")
                     
                     # Fall back to timestamp-based filtering if available
@@ -1029,7 +1041,7 @@ class BackupManager:
                 
                 data = response.json()
                 items = data.get('value', [])
-                
+                logger.info(f"Value {len(items)} items")
                 # Process items
                 for item in items:
                     # Skip deleted items
@@ -1056,42 +1068,24 @@ class BackupManager:
                         else:
                             full_path = f"{user_prefix}/{name}"
                         
-                        # Get download URL (delta API doesn't always include it)
+                        # Get download URL - Delta API should include it, but construct if missing
                         download_url = item.get('@microsoft.graph.downloadUrl', '')
                         
-                        # If no download URL, fetch it separately
+                        # If no download URL in delta response, construct the download endpoint
+                        # This uses the /content endpoint which returns the file content directly
                         if not download_url and item_id:
-                            try:
-                                # Use existing headers (don't refresh token unless needed)
-                                item_response = requests.get(
-                                    f'https://graph.microsoft.com/v1.0/users/{user_id}/drive/items/{item_id}',
-                                    headers=headers
-                                )
-                                
-                                # Handle 401 by refreshing token
-                                if item_response.status_code == 401:
-                                    logger.debug(f"Token expired, refreshing for {name}")
-                                    token = self.microsoft_auth.get_access_token(force_refresh=True)
-                                    headers['Authorization'] = f'Bearer {token}'
-                                    item_response = requests.get(
-                                        f'https://graph.microsoft.com/v1.0/users/{user_id}/drive/items/{item_id}',
-                                        headers=headers
-                                    )
-                                
-                                if item_response.status_code == 200:
-                                    item_data = item_response.json()
-                                    download_url = item_data.get('@microsoft.graph.downloadUrl', '')
-                                    
-                                    # Some files legitimately have no download URL (system files, zero-byte files)
-                                    if not download_url:
-                                        file_size = item.get('size', 0)
-                                        # Only log warning for non-zero files
-                                        if file_size > 0:
-                                            logger.debug(f"No download URL for {name} ({file_size} bytes) - may be restricted")
-                                else:
-                                    logger.debug(f"Failed to fetch metadata: HTTP {item_response.status_code} for {name}")
-                            except Exception as e:
-                                logger.debug(f"Exception fetching download URL for {name}: {e}")
+                            # Get driveId from parentReference or construct from user_id
+                            parent_ref = item.get('parentReference', {})
+                            drive_id = parent_ref.get('driveId', '')
+                            
+                            if drive_id:
+                                # Construct download URL: /drives/{driveId}/items/{itemId}/content
+                                download_url = f'https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content'
+                            else:
+                                # Fallback: use user's drive endpoint
+                                download_url = f'https://graph.microsoft.com/v1.0/users/{user_id}/drive/items/{item_id}/content'
+                            
+                            logger.debug(f"Constructed download URL for {name}: {download_url}")
                         
                         yield {
                             'id': item_id,
@@ -1372,40 +1366,15 @@ class BackupManager:
                         else:
                             full_path = name
                         
-                        # Get download URL (delta API doesn't always include it)
+                        # Get download URL - Delta API should include it, but construct if missing
                         download_url = item.get('@microsoft.graph.downloadUrl', '')
                         
-                        # If no download URL, fetch it separately with retry logic
+                        # If no download URL in delta response, construct the download endpoint
+                        # This uses the /content endpoint which returns the file content directly
                         if not download_url and item_id:
-                            try:
-                                item_response = requests.get(
-                                    f'https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}',
-                                    headers=headers
-                                )
-                                
-                                # Handle 401 by refreshing token
-                                if item_response.status_code == 401:
-                                    logger.debug(f"Token expired, refreshing for {name}")
-                                    token = self.microsoft_auth.get_access_token(force_refresh=True)
-                                    headers['Authorization'] = f'Bearer {token}'
-                                    item_response = requests.get(
-                                        f'https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}',
-                                        headers=headers
-                                    )
-                                
-                                if item_response.status_code == 200:
-                                    item_data = item_response.json()
-                                    download_url = item_data.get('@microsoft.graph.downloadUrl', '')
-                                    
-                                    # Some files legitimately have no download URL
-                                    if not download_url:
-                                        file_size = item.get('size', 0)
-                                        if file_size > 0:
-                                            logger.debug(f"No download URL for {name} ({file_size} bytes) - may be restricted")
-                                else:
-                                    logger.debug(f"Failed to fetch metadata: HTTP {item_response.status_code} for {name}")
-                            except Exception as e:
-                                logger.debug(f"Exception fetching download URL for {name}: {e}")
+                            # Construct download URL: /drives/{driveId}/items/{itemId}/content
+                            download_url = f'https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content'
+                            logger.debug(f"Constructed download URL for {name}: {download_url}")
                         
                         yield {
                             'id': item_id,
@@ -1582,7 +1551,7 @@ class BackupManager:
     def _stream_to_aws_s3(self, file_path: str, download_url: str, file_size: int, 
                                content_type: str, destination_config, 
                                file_info: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Stream file to AWS S3.
+        """Stream file to AWS S3 with automatic credential refresh on expiration.
         
         Args:
             file_path: File path for storage
@@ -1600,32 +1569,79 @@ class BackupManager:
             import io
 
             import requests
+            from botocore.exceptions import ClientError
 
             s3_client = self.aws_auth.get_s3_client()
             
             prefix = getattr(destination_config, 'prefix', '')
             s3_key = f"{prefix}{file_path}".lstrip('/')
             
-            response = requests.get(download_url, stream=True)
+            # Check if this is a Microsoft Graph API URL that requires authentication
+            # @microsoft.graph.downloadUrl URLs are pre-authenticated and don't need headers
+            # But /content endpoint URLs require Bearer token
+            needs_auth = 'graph.microsoft.com' in download_url and '/content' in download_url
+            
+            if needs_auth:
+                # Get fresh token for download (handles token expiration)
+                token = self.microsoft_auth.get_access_token()
+                headers = {'Authorization': f'Bearer {token}'}
+                response = requests.get(download_url, headers=headers, stream=True)
+                
+                # Handle 401 by refreshing token and retrying
+                if response.status_code == 401:
+                    logger.debug(f"Microsoft Graph token expired during download, refreshing...")
+                    token = self.microsoft_auth.get_access_token(force_refresh=True)
+                    headers = {'Authorization': f'Bearer {token}'}
+                    response = requests.get(download_url, headers=headers, stream=True)
+            else:
+                # Pre-authenticated download URL (no auth needed)
+                response = requests.get(download_url, stream=True)
             
             if response.status_code == 200:
                 encoded_path = base64.b64encode(file_path.encode('utf-8')).decode('ascii')
                 modified_time = file_info.get('lastModifiedDateTime', '') if file_info else ''
                 
-                s3_client.upload_fileobj(
-                    Fileobj=io.BytesIO(response.content),
-                    Bucket=destination_config.bucket,
-                    Key=s3_key,
-                    ExtraArgs={
-                        'ContentType': content_type,
-                        'Metadata': {
-                            'original-path-encoded': encoded_path,
-                            'source': 'onedrive-backup',
-                            'encoding': 'base64-utf8',
-                            'source-modified-time': modified_time
+                file_content = io.BytesIO(response.content)
+                
+                # Try upload with retry on credential expiration
+                try:
+                    s3_client.upload_fileobj(
+                        Fileobj=file_content,
+                        Bucket=destination_config.bucket,
+                        Key=s3_key,
+                        ExtraArgs={
+                            'ContentType': content_type,
+                            'Metadata': {
+                                'original-path-encoded': encoded_path,
+                                'source': 'onedrive-backup',
+                                'encoding': 'base64-utf8',
+                                'source-modified-time': modified_time
+                            }
                         }
-                    }
-                )
+                    )
+                except ClientError as e:
+                    error_code = e.response.get('Error', {}).get('Code', '')
+                    if error_code in ['ExpiredToken', '401', 'InvalidAccessKeyId', 'SignatureDoesNotMatch']:
+                        logger.info(f"AWS credentials expired during upload, refreshing and retrying...")
+                        s3_client = self.aws_auth.refresh_credentials()
+                        # Reset file content position for retry
+                        file_content.seek(0)
+                        s3_client.upload_fileobj(
+                            Fileobj=file_content,
+                            Bucket=destination_config.bucket,
+                            Key=s3_key,
+                            ExtraArgs={
+                                'ContentType': content_type,
+                                'Metadata': {
+                                    'original-path-encoded': encoded_path,
+                                    'source': 'onedrive-backup',
+                                    'encoding': 'base64-utf8',
+                                    'source-modified-time': modified_time
+                                }
+                            }
+                        )
+                    else:
+                        raise
                 
                 return {
                     'success': True,

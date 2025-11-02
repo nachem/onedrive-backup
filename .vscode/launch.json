@@ -8,7 +8,8 @@
             "module": "src.onedrive_backup.cli",
             "args": [
                 "backup",
-                "--job", "onedrive_backup",
+                "--job",
+                "onedrive_backup",
                 "--dry-run"
             ],
             "console": "integratedTerminal",
@@ -26,7 +27,8 @@
             "module": "src.onedrive_backup.cli",
             "args": [
                 "backup",
-                "--job", "sharepoint_backup",
+                "--job",
+                "sharepoint_backup",
                 "--dry-run"
             ],
             "console": "integratedTerminal",
@@ -44,11 +46,11 @@
             "module": "src.onedrive_backup.cli",
             "args": [
                 "backup",
-                "--job", "onedrive_backup"
+                "--job",
+                "onedrive_backup"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
-            "cwd": "${workspaceFolder}",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}",
                 "PYTHONIOENCODING": "utf-8"
@@ -61,7 +63,8 @@
             "module": "src.onedrive_backup.cli",
             "args": [
                 "backup",
-                "--job", "sharepoint_backup"
+                "--job",
+                "sharepoint_backup"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
@@ -94,7 +97,8 @@
             "module": "src.onedrive_backup.cli",
             "args": [
                 "list-onedrive-files",
-                "--user", "maayan@bernoulli.tech",
+                "--user",
+                "maayan@bernoulli.tech",
                 "--recursive"
             ],
             "console": "integratedTerminal",

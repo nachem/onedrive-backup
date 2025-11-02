@@ -1,6 +1,4 @@
 {
-    "python.defaultInterpreterPath": "C:\\Users\\NachemRosenberg\\anaconda3\\envs\\cloud_backup\\python.exe",
-    "python.terminal.activateEnvironment": true,
     "python.terminal.activateEnvInCurrentTerminal": true,
     "files.exclude": {
         "**/__pycache__": true,
