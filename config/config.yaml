@@ -11,12 +11,12 @@ sources:
   - type: onedrive_personal
     name: "Work OneDrive"
     folders: ["all"]
-    users: ["nachem@bernoulli.tech"] # "all" for all users, or list specific emails: ["user1@domain.com", "user2@domain.com"]
+    # users: ["all"] # "all" for all users, or list specific emails: ["user1@domain.com", "user2@domain.com"]
 
   - type: sharepoint
     name: "Company SharePoint"
     site_url: "https://bernoullisofrware.sharepoint.com"
-    libraries: ["Documents", "Invoices"]
+    libraries: ["all"]
 
 # Define your backup destinations (cloud storage)
 destinations:
@@ -28,7 +28,7 @@ destinations:
 
 # Define backup jobs (which sources go to which destinations)
 backup_jobs:
-  - name: "sharepoint_backup"
+  - name: "all"
     sources: ["Work OneDrive", "Company SharePoint"]
     destination: "aws_backup"
     #schedule: "0 2 * * *"  # Daily at 2 AM (cron format)

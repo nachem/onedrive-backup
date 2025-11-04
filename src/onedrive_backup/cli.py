@@ -1,19 +1,20 @@
 """Command-line interface for the OneDrive backup application."""
 
-import click
 import asyncio
+import os
 import sys
 from pathlib import Path
-from rich.console import Console
-from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich import print as rprint
-import os
 
-from .config.settings import BackupConfig, CredentialsConfig
-from .sync.backup_manager import BackupManager
-from .sources.onedrive_operations import OneDriveFileManager
+import click
+from rich import print as rprint
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
+
 from .auth.microsoft_auth import MicrosoftGraphAuth
+from .config.settings import BackupConfig, CredentialsConfig
+from .sources.onedrive_operations import OneDriveFileManager
+from .sync.backup_manager import BackupManager
 
 # Force UTF-8 encoding for Windows console to handle Unicode characters
 if sys.platform == 'win32':
@@ -86,12 +87,12 @@ async def _run_backup_async(backup_manager: BackupManager, job_name: str, dry_ru
             return
         
         console.print(f"🚀 Running backup job: {job_name}")
-        results = [await backup_manager.run_backup_job(job_config)]
+        results = [backup_manager.run_backup_job(job_config)]
     else:
         # Run all enabled jobs
         enabled_jobs = backup_manager.config.get_enabled_jobs()
         console.print(f"🚀 Running {len(enabled_jobs)} enabled backup jobs")
-        results = await backup_manager.run_all_jobs()
+        results = backup_manager.run_all_jobs()
     
     # Display results
     _display_backup_results(results, backup_manager)
