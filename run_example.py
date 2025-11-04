@@ -22,6 +22,7 @@ from onedrive_backup.config.settings import BackupConfig, CredentialsConfig
 from onedrive_backup.sync.backup_manager import BackupManager
 from onedrive_backup.utils.logging import setup_logging
 
+
 async def main():
     """Main example function."""
     print("🚀 OneDrive/SharePoint Backup Tool - Example Run")
@@ -99,7 +100,7 @@ async def main():
             for job in enabled_jobs[:1]:  # Run only first job for demo
                 print(f"\n▶️  Processing job: {job.name}")
                 try:
-                    result = await backup_manager.run_backup_job(job)
+                    result = backup_manager.run_backup_job(job)
                     
                     print(f"   Status: {result['status']}")
                     print(f"   Duration: {result.get('duration', 0):.2f}s")

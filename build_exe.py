@@ -3,13 +3,22 @@
 Build script to create standalone executable for OneDrive Backup Tool.
 
 This script uses PyInstaller to create a single executable file that includes
-all dependencies and can be run on any Windows machine without Python installed.
+all dependencies and can be run on Windows or Linux machines without Python installed.
+
+Usage:
+    python build_exe.py              # Build for current platform
+    python build_exe.py --windows    # Build for Windows
+    python build_exe.py --ubuntu     # Build for Ubuntu/Linux
+    python build_exe.py --all        # Build for all platforms
 """
 
+import argparse
+import os
+import platform
 import subprocess
 import sys
-import os
 from pathlib import Path
+
 
 def install_pyinstaller():
     """Install PyInstaller if not already installed."""
@@ -27,17 +36,48 @@ def install_pyinstaller():
             print(f"❌ Failed to install PyInstaller: {e}")
             return False
 
-def create_spec_file():
-    """Create PyInstaller spec file for customized build."""
-    spec_content = '''# -*- mode: python ; coding: utf-8 -*-
+def get_platform_info():
+    """Determine the current platform and supported targets."""
+    current_os = platform.system().lower()
+    return {
+        'current': current_os,
+        'is_windows': current_os == 'windows',
+        'is_linux': current_os == 'linux',
+        'is_macos': current_os == 'darwin'
+    }
+
+def create_spec_file(target_platform='auto'):
+    """Create PyInstaller spec file for customized build.
+    
+    Args:
+        target_platform: 'windows', 'linux', or 'auto' to detect current platform
+    """
+    platform_info = get_platform_info()
+    
+    if target_platform == 'auto':
+        if platform_info['is_windows']:
+            target_platform = 'windows'
+        elif platform_info['is_linux']:
+            target_platform = 'linux'
+        else:
+            target_platform = 'linux'  # Default to linux for macOS or other
+    
+    exe_name = 'onedrive-backup.exe' if target_platform == 'windows' else 'onedrive-backup'
+    
+    spec_content = f"""# -*- mode: python ; coding: utf-8 -*-
+# PyInstaller spec file for {target_platform}
+
+import sys
+sys.path.insert(0, 'src')
 
 block_cipher = None
 
 a = Analysis(
-    ['src/onedrive_backup/cli.py'],
-    pathex=[],
+    ['run_cli.py'],
+    pathex=['src'],
     binaries=[],
     datas=[
+        ('src/onedrive_backup', 'onedrive_backup'),
         ('config/config.yaml', 'config'),
         ('config/credentials.yaml.template', 'config'),
         ('README.md', '.'),
@@ -88,7 +128,7 @@ a = Analysis(
         'hashlib'
     ],
     hookspath=[],
-    hooksconfig={},
+    hooksconfig={{}},
     runtime_hooks=[],
     excludes=[],
     win_no_prefer_redirects=False,
@@ -106,7 +146,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='onedrive-backup',
+    name='{exe_name}',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -121,22 +161,45 @@ exe = EXE(
     entitlements_file=None,
     icon=None,
 )
-'''
+"""
     
-    spec_path = Path("onedrive-backup.spec")
+    spec_filename = f"onedrive-backup-{target_platform}.spec"
+    spec_path = Path(spec_filename)
     with open(spec_path, 'w') as f:
         f.write(spec_content)
     
-    print(f"✅ Created spec file: {spec_path}")
-    return spec_path
+    print(f"✅ Created spec file for {target_platform}: {spec_path}")
+    return spec_path, target_platform
 
-def build_executable():
-    """Build the executable using PyInstaller."""
-    print("\n🔧 Building executable...")
+def build_executable(target_platform='auto'):
+    """Build the executable using PyInstaller.
+    
+    Args:
+        target_platform: 'windows', 'linux', or 'auto' to detect current platform
+    """
+    platform_info = get_platform_info()
+    
+    if target_platform == 'auto':
+        if platform_info['is_windows']:
+            target_platform = 'windows'
+        elif platform_info['is_linux']:
+            target_platform = 'linux'
+        else:
+            target_platform = 'linux'
+    
+    # Validate platform compatibility
+    if target_platform == 'windows' and not platform_info['is_windows']:
+        print("⚠️  Cross-compilation to Windows from non-Windows platform is not fully supported")
+        print("    The executable may not work correctly. Consider building on Windows.")
+    elif target_platform == 'linux' and platform_info['is_windows']:
+        print("⚠️  Cross-compilation to Linux from Windows is not fully supported")
+        print("    The executable may not work correctly. Consider building on Linux/Ubuntu.")
+    
+    print(f"\n� Building executable for {target_platform}...")
     
     try:
         # Create spec file
-        spec_path = create_spec_file()
+        spec_path, platform_target = create_spec_file(target_platform)
         
         # Run PyInstaller with the spec file
         cmd = [
@@ -152,7 +215,8 @@ def build_executable():
             print("✅ Build completed successfully!")
             
             # Check if executable was created
-            exe_path = Path("dist") / "onedrive-backup.exe"
+            exe_name = "onedrive-backup.exe" if platform_target == 'windows' else "onedrive-backup"
+            exe_path = Path("dist") / exe_name
             if exe_path.exists():
                 size_mb = exe_path.stat().st_size / (1024 * 1024)
                 print(f"📦 Executable created: {exe_path}")
@@ -203,18 +267,39 @@ def test_executable(exe_path):
         print(f"❌ Test error: {e}")
         return False
 
-def create_distribution_package():
-    """Create a distribution package with the executable and config files."""
-    print("\n📦 Creating distribution package...")
+def create_distribution_package(target_platform='auto'):
+    """Create a distribution package with the executable and config files.
     
-    dist_dir = Path("dist/onedrive-backup-portable")
+    Args:
+        target_platform: 'windows', 'linux', or 'auto' to detect current platform
+    """
+    platform_info = get_platform_info()
+    
+    if target_platform == 'auto':
+        if platform_info['is_windows']:
+            target_platform = 'windows'
+        elif platform_info['is_linux']:
+            target_platform = 'linux'
+        else:
+            target_platform = 'linux'
+    
+    print(f"\n📦 Creating distribution package for {target_platform}...")
+    
+    dist_dir = Path(f"dist/onedrive-backup-portable-{target_platform}")
     dist_dir.mkdir(exist_ok=True)
     
     # Copy executable
-    exe_path = Path("dist/onedrive-backup.exe")
+    exe_name = "onedrive-backup.exe" if target_platform == 'windows' else "onedrive-backup"
+    exe_path = Path("dist") / exe_name
     if exe_path.exists():
         import shutil
-        shutil.copy2(exe_path, dist_dir / "onedrive-backup.exe")
+        dest_exe = dist_dir / exe_name
+        shutil.copy2(exe_path, dest_exe)
+        
+        # Make executable on Linux
+        if target_platform == 'linux':
+            os.chmod(dest_exe, 0o755)
+        
         print(f"✅ Copied executable to {dist_dir}")
     
     # Copy config files
@@ -236,8 +321,9 @@ def create_distribution_package():
             shutil.copy2(src_path, dst_path)
             print(f"✅ Copied {src} to {dst_path}")
     
-    # Create startup batch file
-    batch_content = '''@echo off
+    # Create startup script (platform-specific)
+    if target_platform == 'windows':
+        batch_content = '''@echo off
 echo OneDrive/SharePoint Backup Tool
 echo ===============================
 echo.
@@ -254,19 +340,105 @@ echo   onedrive-backup test
 echo.
 cmd /k
 '''
+        script_path = dist_dir / "start.bat"
+        with open(script_path, 'w') as f:
+            f.write(batch_content)
+    else:  # Linux
+        script_content = '''#!/bin/bash
+echo "OneDrive/SharePoint Backup Tool"
+echo "==============================="
+echo ""
+echo "Available commands:"
+echo "  ./onedrive-backup --help     Show help"
+echo "  ./onedrive-backup status     Show configuration status"
+echo "  ./onedrive-backup test       Test connections"
+echo "  ./onedrive-backup backup     Run backup jobs"
+echo "  ./onedrive-backup init       Initialize configuration"
+echo ""
+echo "Examples:"
+echo "  ./onedrive-backup backup --dry-run"
+echo "  ./onedrive-backup test"
+echo ""
+exec bash
+'''
+        script_path = dist_dir / "start.sh"
+        with open(script_path, 'w') as f:
+            f.write(script_content)
+        os.chmod(script_path, 0o755)
     
-    batch_path = dist_dir / "start.bat"
-    with open(batch_path, 'w') as f:
-        f.write(batch_content)
-    print(f"✅ Created startup script: {batch_path}")
+    print(f"✅ Created startup script: {script_path}")
     
     print(f"\n🎉 Distribution package ready: {dist_dir}")
     return dist_dir
 
+def build_for_platform(target_platform):
+    """Build executable for a specific platform."""
+    print(f"\n{'=' * 60}")
+    print(f"Building for: {target_platform.upper()}")
+    print(f"{'=' * 60}")
+    
+    # Build executable
+    exe_path = build_executable(target_platform)
+    if not exe_path:
+        return False
+    
+    # Test executable (only if building for current platform)
+    platform_info = get_platform_info()
+    can_test = (target_platform == 'windows' and platform_info['is_windows']) or \
+               (target_platform == 'linux' and platform_info['is_linux'])
+    
+    if can_test:
+        if not test_executable(exe_path):
+            print("⚠️ Executable built but failed testing")
+    else:
+        print(f"ℹ️  Skipping test (cross-compiled for {target_platform})")
+    
+    # Create distribution package
+    dist_package = create_distribution_package(target_platform)
+    
+    print(f"\n✅ Build for {target_platform} completed!")
+    print(f"📁 Files created:")
+    print(f"   • Executable: {exe_path}")
+    print(f"   • Distribution: {dist_package}")
+    
+    if target_platform == 'linux':
+        print(f"\n🚀 To run on Ubuntu/Linux:")
+        print(f"   chmod +x {exe_path}")
+        print(f"   {exe_path} --help")
+    else:
+        print(f"\n🚀 To run on Windows:")
+        print(f"   {exe_path} --help")
+    
+    return True
+
 def main():
     """Main build function."""
+    parser = argparse.ArgumentParser(
+        description='Build OneDrive Backup Tool executable',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  python build_exe.py              # Build for current platform
+  python build_exe.py --windows    # Build for Windows
+  python build_exe.py --ubuntu     # Build for Ubuntu/Linux
+  python build_exe.py --all        # Build for all platforms
+        '''
+    )
+    parser.add_argument('--windows', action='store_true', 
+                       help='Build for Windows')
+    parser.add_argument('--ubuntu', '--linux', action='store_true', dest='ubuntu',
+                       help='Build for Ubuntu/Linux')
+    parser.add_argument('--all', action='store_true',
+                       help='Build for all platforms')
+    
+    args = parser.parse_args()
+    
     print("🚀 OneDrive Backup Tool - Executable Builder")
-    print("=" * 50)
+    print("=" * 60)
+    
+    platform_info = get_platform_info()
+    print(f"Current platform: {platform_info['current']}")
+    print("=" * 60)
     
     # Check if we're in the right directory
     if not Path("src/onedrive_backup/cli.py").exists():
@@ -277,29 +449,38 @@ def main():
     if not install_pyinstaller():
         return 1
     
-    # Build executable
-    exe_path = build_executable()
-    if not exe_path:
-        return 1
+    # Determine which platforms to build
+    platforms_to_build = []
     
-    # Test executable
-    if not test_executable(exe_path):
-        print("⚠️ Executable built but failed testing")
+    if args.all:
+        platforms_to_build = ['windows', 'linux']
+    elif args.windows:
+        platforms_to_build = ['windows']
+    elif args.ubuntu:
+        platforms_to_build = ['linux']
+    else:
+        # Default to current platform
+        if platform_info['is_windows']:
+            platforms_to_build = ['windows']
+        elif platform_info['is_linux']:
+            platforms_to_build = ['linux']
+        else:
+            platforms_to_build = ['linux']
     
-    # Create distribution package
-    dist_package = create_distribution_package()
+    # Build for each platform
+    success = True
+    for platform_target in platforms_to_build:
+        if not build_for_platform(platform_target):
+            success = False
     
-    print("\n" + "=" * 50)
-    print("✅ Build completed successfully!")
-    print("\n📁 Files created:")
-    print(f"   • Executable: {exe_path}")
-    print(f"   • Distribution: {dist_package}")
-    print("\n🚀 To run the executable:")
-    print(f"   {exe_path} --help")
-    print(f"   {exe_path} test")
-    print(f"   {exe_path} backup --dry-run")
+    print("\n" + "=" * 60)
+    if success:
+        print("✅ All builds completed successfully!")
+    else:
+        print("⚠️ Some builds failed. Check the output above.")
+    print("=" * 60)
     
-    return 0
+    return 0 if success else 1
 
 if __name__ == "__main__":
     exit_code = main()
