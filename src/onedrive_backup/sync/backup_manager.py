@@ -628,6 +628,117 @@ class BackupManager:
         
         logger.debug(f"Worker {worker_id} stopped")
     
+    def _process_items_with_delta(self, items_to_process, source_config, destination_config, 
+                                   job_config, stream_files_func) -> Dict[str, Any]:
+        """Process items (users or drives) with parallel workers and delta sync.
+        
+        This is a shared method used by both OneDrive and SharePoint sources.
+        
+        Args:
+            items_to_process: List of items (users or drives) to process
+            source_config: Source configuration
+            destination_config: Destination configuration
+            job_config: Job configuration
+            stream_files_func: Function to stream files for each item
+            
+        Returns:
+            Dictionary with processing results
+        """
+        results = {
+            'files_processed': 0,
+            'files_uploaded': 0,
+            'files_skipped': 0,
+            'bytes_transferred': 0,
+            'errors': []
+        }
+        
+        # Get fresh headers
+        token = self.microsoft_auth.get_access_token()
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Process each item with parallel workers
+        for item_info in items_to_process:
+            try:
+                item_id = item_info['id']
+                item_name = item_info['name']
+                
+                logger.info(f"Processing: {item_name}")
+                logger.info(f"Using {self.max_parallel_workers} parallel workers")
+                
+                # Get delta token and timestamp for this item
+                delta_info = self._get_delta_token(source_config.name, item_id, destination_config)
+                delta_token_url = delta_info.get('delta_token') if delta_info else None
+                fallback_timestamp = delta_info.get('last_backup_time') if delta_info else None
+                
+                # Create queue manager for this item
+                queue_manager = FileQueueManager(max_workers=self.max_parallel_workers)
+                
+                # Track final delta token
+                final_delta_token = None
+                
+                # Start worker threads
+                with ThreadPoolExecutor(max_workers=self.max_parallel_workers) as executor:
+                    # Submit worker tasks
+                    worker_futures = [
+                        executor.submit(
+                            self._parallel_upload_worker,
+                            queue_manager,
+                            destination_config,
+                            job_config,
+                            i
+                        )
+                        for i in range(self.max_parallel_workers)
+                    ]
+                    logger.info(f"Started {self.max_parallel_workers} worker threads for {item_name}")
+                    
+                    # Producer: Stream files from Delta API and add to queue
+                    for file_info in stream_files_func(item_info, headers, delta_token_url, fallback_timestamp):
+                        # Capture final delta token (arrives only at the very end)
+                        if isinstance(file_info, dict) and file_info.get('_delta_token'):
+                            final_delta_token = file_info['_delta_token']
+                            continue
+                        
+                        # Add file to queue
+                        queue_manager.add_file(file_info)
+                    
+                    # Save final delta token if we have one
+                    if final_delta_token and not getattr(job_config, 'dry_run', False):
+                        self._save_delta_token(source_config.name, item_id, final_delta_token, destination_config)
+                        logger.info(f"✅ Delta token saved (incremental sync will resume from this point)")
+                    
+                    logger.info(f"Producer finished adding files for {item_name}")
+                    # Producer finished - signal workers that no more files are coming
+                    logger.debug(f"Producer finished for {item_name}, sending sentinel values")
+                    queue_manager.signal_done()
+                    
+                    # Wait for all workers to complete
+                    for future in as_completed(worker_futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logger.error(f"Worker thread error: {e}")
+                
+                # Aggregate results from queue manager
+                item_stats = queue_manager.get_stats()
+                results['files_processed'] += item_stats['files_processed']
+                results['files_uploaded'] += item_stats['files_uploaded']
+                results['files_skipped'] += item_stats['files_skipped']
+                results['bytes_transferred'] += item_stats['bytes_transferred']
+                results['errors'].extend(item_stats['errors'])
+                
+                logger.info(f"Completed {item_name}: {item_stats['files_uploaded']} uploaded, "
+                           f"{item_stats['files_skipped']} skipped, {item_stats['files_processed']} total")
+            
+            except Exception as e:
+                error_msg = f"Error processing {item_info.get('name', 'unknown')}: {str(e)}"
+                results['errors'].append(error_msg)
+                logger.error(error_msg)
+        
+        return results
+
     def _process_onedrive_source(self, source_config, destination_config, job_config) -> Dict[str, Any]:
         """Process OneDrive personal source with parallel incremental backup support.
         
@@ -640,7 +751,6 @@ class BackupManager:
             Dictionary with processing results
         """
         import requests
-        from dateutil import parser as date_parser
 
         from ..sources.onedrive_operations import OneDriveFileManager
         
@@ -656,16 +766,12 @@ class BackupManager:
             # Initialize OneDrive file manager
             onedrive_manager = OneDriveFileManager(self.microsoft_auth)
             
-            # Get access token - use a method that returns fresh headers
-            def get_fresh_headers():
-                """Get fresh headers with current token."""
-                token = self.microsoft_auth.get_access_token()
-                return {
-                    'Authorization': f'Bearer {token}',
-                    'Content-Type': 'application/json'
-                }
-            
-            headers = get_fresh_headers()
+            # Get access token
+            token = self.microsoft_auth.get_access_token()
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json'
+            }
             
             # Get all users with OneDrive
             logger.info(f"Discovering users with OneDrive for: {source_config.name}")
@@ -721,82 +827,18 @@ class BackupManager:
                 logger.info(f"Processing all {len(users_with_onedrive)} users")
                 users_to_process = users_with_onedrive
             
-            # Process each user's OneDrive with parallel workers
-            for user_info in users_to_process:
-                try:
-                    logger.info(f"Processing OneDrive for: {user_info['name']} ({user_info['email']})")
-                    logger.info(f"Using {self.max_parallel_workers} parallel workers")
-                    user_prefix = user_info['email'].split('@')[0]
-                    
-                    # Get delta token and timestamp for this user
-                    delta_info = self._get_delta_token(source_config.name, user_info['id'], destination_config)
-                    delta_token_url = delta_info.get('delta_token') if delta_info else None
-                    fallback_timestamp = delta_info.get('last_backup_time') if delta_info else None
-                    
-                    # Create queue manager for this user
-                    queue_manager = FileQueueManager(max_workers=self.max_parallel_workers)
-                    
-                    # Start worker threads
-                    with ThreadPoolExecutor(max_workers=self.max_parallel_workers) as executor:
-                        # Submit worker tasks
-                        worker_futures = [
-                            executor.submit(
-                                self._parallel_upload_worker,
-                                queue_manager,
-                                destination_config,
-                                job_config,
-                                i
-                            )
-                            for i in range(self.max_parallel_workers)
-                        ]
-                        logger.info(f"Started {self.max_parallel_workers} worker threads for {user_info['name']}")
-                        # files = 0
-                        # Producer: Stream files from Delta API and add to queue
-                        for file_info in self._stream_onedrive_files_delta(
-                            user_info['id'], headers, user_prefix, delta_token_url, fallback_timestamp
-                        ):
-                            # logger.info(f"Producer received file: {file_info.get('name', 'unknown')}")
-                            # files += 1
-                            # if files > 10:
-                            #     break
-                            # Capture and IMMEDIATELY save the new delta token
-                            if isinstance(file_info, dict) and file_info.get('_delta_token'):
-                                new_delta_token = file_info['_delta_token']
-                                # ✅ Save immediately to allow resume if interrupted
-                                if not getattr(job_config, 'dry_run', False):
-                                    self._save_delta_token(source_config.name, user_info['id'], new_delta_token, destination_config)
-                                    logger.info(f"✅ Saved delta token (backup can resume from this point if interrupted)")
-                                continue
-                            
-                            # Add file to queue - run in executor to avoid blocking async loop
-                            queue_manager.add_file(file_info)
-                        logger.info(f"Producer finished adding files for {user_info['name']}")
-                        # Producer finished - signal workers that no more files are coming
-                        logger.debug(f"Producer finished for {user_info['name']}, sending sentinel values")
-                        queue_manager.signal_done()
-                        
-                        # Wait for all workers to complete
-                        for future in as_completed(worker_futures):
-                            try:
-                                future.result()
-                            except Exception as e:
-                                logger.error(f"Worker thread error: {e}")
-                    
-                    # Aggregate results from queue manager
-                    user_stats = queue_manager.get_stats()
-                    results['files_processed'] += user_stats['files_processed']
-                    results['files_uploaded'] += user_stats['files_uploaded']
-                    results['files_skipped'] += user_stats['files_skipped']
-                    results['bytes_transferred'] += user_stats['bytes_transferred']
-                    results['errors'].extend(user_stats['errors'])
-                    
-                    logger.info(f"Completed {user_info['name']}: {user_stats['files_uploaded']} uploaded, "
-                               f"{user_stats['files_skipped']} skipped, {user_stats['files_processed']} total")
-                
-                except Exception as e:
-                    error_msg = f"Error processing OneDrive for {user_info.get('name', 'unknown')}: {str(e)}"
-                    results['errors'].append(error_msg)
-                    logger.error(error_msg)
+            # Define streaming function for OneDrive users
+            def stream_onedrive_user_files(user_info, headers, delta_token_url, fallback_timestamp):
+                user_prefix = user_info['email'].split('@')[0]
+                return self._stream_onedrive_files_delta(
+                    user_info['id'], headers, user_prefix, delta_token_url, fallback_timestamp
+                )
+            
+            # Process all users with shared logic
+            results = self._process_items_with_delta(
+                users_to_process, source_config, destination_config, job_config,
+                stream_onedrive_user_files
+            )
             
         except Exception as e:
             logger.error(f"Error processing OneDrive source {source_config.name}: {e}")
@@ -816,7 +858,6 @@ class BackupManager:
             Dictionary with processing results
         """
         import requests
-        from dateutil import parser as date_parser
         
         results = {
             'files_processed': 0,
@@ -826,7 +867,6 @@ class BackupManager:
             'errors': []
         }
         
-       
         try:
             # Get access token
             token = self.microsoft_auth.get_access_token()
@@ -851,78 +891,36 @@ class BackupManager:
             drives = drives_response.json().get('value', [])
             logger.info(f"Found {len(drives)} SharePoint drives")
             
-            # Process each drive with parallel workers
-            for drive in drives:
-                drive_name = drive.get('name', 'Unknown')
-                drive_id = drive.get('id')
-                
-                logger.info(f"Processing drive: {drive_name}")
-                logger.info(f"Using {self.max_parallel_workers} parallel workers")
-                
-                # Get delta token and timestamp for this drive
-                delta_info = self._get_delta_token(source_config.name, drive_id, destination_config)
-                delta_token_url = delta_info.get('delta_token') if delta_info else None
-                fallback_timestamp = delta_info.get('last_backup_time') if delta_info else None
-                
-                # Create queue manager for this drive
-                queue_manager = FileQueueManager(max_workers=self.max_parallel_workers)
-                
-                # Start worker threads
-                with ThreadPoolExecutor(max_workers=self.max_parallel_workers) as executor:
-                    # Submit worker tasks
-                    worker_futures = [
-                        executor.submit(
-                            self._parallel_upload_worker,
-                            queue_manager,
-                            destination_config,
-                            job_config,
-                            i
-                        )
-                        for i in range(self.max_parallel_workers)
-                    ]
-                    
-                    # Producer: Stream files from Delta API and add to queue
-                    for file_info in self._stream_sharepoint_files_delta(
-                        drive_id, headers, drive_name, delta_token_url, fallback_timestamp
-                    ):
-                        # Capture and IMMEDIATELY save the new delta token
-                        if isinstance(file_info, dict) and file_info.get('_delta_token'):
-                            new_delta_token = file_info['_delta_token']
-                            # ✅ Save immediately to allow resume if interrupted
-                            if not getattr(job_config, 'dry_run', False):
-                                self._save_delta_token(source_config.name, drive_id, new_delta_token, destination_config)
-                                logger.info(f"✅ Saved delta token for {drive_name} (backup can resume from this point if interrupted)")
-                            continue
-                        
+            # Convert drives to common format
+            drives_to_process = [
+                {
+                    'id': drive.get('id'),
+                    'name': drive.get('name', 'Unknown')
+                }
+                for drive in drives
+            ]
+            
+            # Define streaming function for SharePoint drives
+            def stream_sharepoint_drive_files(drive_info, headers, delta_token_url, fallback_timestamp):
+                drive_name = drive_info['name']
+                # Stream files and prepend drive name to paths
+                for file_info in self._stream_sharepoint_files_delta(
+                    drive_info['id'], headers, drive_name, delta_token_url, fallback_timestamp
+                ):
+                    # Skip delta token markers (they'll be handled by the shared logic)
+                    if isinstance(file_info, dict) and file_info.get('_delta_token'):
+                        yield file_info
+                    else:
                         # Add full S3 path including drive name
                         file_path = file_info.get('path', file_info.get('name', ''))
                         full_s3_path = f"{drive_name}/{file_path}"
-                        file_info_with_full_path = {**file_info, 'path': full_s3_path}
-                        
-                        # Add file to queue - run in executor to avoid blocking async loop
-                        queue_manager.add_file(file_info_with_full_path)
-                    
-                    # Producer finished - signal workers that no more files are coming
-                    logger.debug(f"Producer finished for {drive_name}, sending sentinel values")
-                    queue_manager.signal_done()
-                    
-                    # Wait for all workers to complete
-                    for future in as_completed(worker_futures):
-                        try:
-                            future.result()
-                        except Exception as e:
-                            logger.error(f"Worker thread error: {e}")
-                
-                # Aggregate results from queue manager
-                drive_stats = queue_manager.get_stats()
-                results['files_processed'] += drive_stats['files_processed']
-                results['files_uploaded'] += drive_stats['files_uploaded']
-                results['files_skipped'] += drive_stats['files_skipped']
-                results['bytes_transferred'] += drive_stats['bytes_transferred']
-                results['errors'].extend(drive_stats['errors'])
-                
-                logger.info(f"Completed {drive_name}: {drive_stats['files_uploaded']} uploaded, "
-                           f"{drive_stats['files_skipped']} skipped, {drive_stats['files_processed']} total")
+                        yield {**file_info, 'path': full_s3_path}
+            
+            # Process all drives with shared logic
+            results = self._process_items_with_delta(
+                drives_to_process, source_config, destination_config, job_config,
+                stream_sharepoint_drive_files
+            )
             
         except Exception as e:
             error_msg = f"Error processing SharePoint source {source_config.name}: {str(e)}"
@@ -930,22 +928,90 @@ class BackupManager:
             results['errors'].append(error_msg)
         
         return results
-    times = 0
     def _stream_onedrive_files_delta(self, user_id: str, headers: Dict[str, str],
                                            user_prefix: str = "", delta_token: Optional[str] = None,
                                            fallback_timestamp: Optional[str] = None):
-        """Stream files from OneDrive using Delta API with timestamp fallback.
+        """Stream files from OneDrive using Delta API (wrapper for shared implementation).
+        
+        Args:
+            user_id: User ID
+            headers: Authentication headers
+            user_prefix: User prefix for path construction
+            delta_token: Delta link from previous sync
+            fallback_timestamp: ISO timestamp for fallback filtering
+            
+        Yields:
+            File information dictionaries
+        """
+        # Create fallback function for OneDrive
+        def fallback_func(modified_after):
+            return self._stream_onedrive_files_recursive(
+                user_id, headers, folder_id='root', user_prefix=user_prefix,
+                modified_after=modified_after
+            )
+        
+        # Call shared implementation
+        return self._stream_delta_files(
+            resource_id=user_id,
+            resource_type='users',
+            headers=headers,
+            path_prefix=user_prefix,
+            delta_token=delta_token,
+            fallback_timestamp=fallback_timestamp,
+            fallback_func=fallback_func
+        )
+    
+    def _stream_sharepoint_files_delta(self, drive_id: str, headers: Dict[str, str],
+                                             drive_name: str = "", delta_token: Optional[str] = None,
+                                             fallback_timestamp: Optional[str] = None):
+        """Stream files from SharePoint using Delta API (wrapper for shared implementation).
+        
+        Args:
+            drive_id: Drive ID
+            headers: Authentication headers
+            drive_name: Drive name for path construction
+            delta_token: Delta link from previous sync
+            fallback_timestamp: ISO timestamp for fallback filtering
+            
+        Yields:
+            File information dictionaries
+        """
+        # Create fallback function for SharePoint
+        def fallback_func(modified_after):
+            return self._stream_sharepoint_files_recursive(
+                drive_id, headers, folder_id='root', path="",
+                modified_after=modified_after
+            )
+        
+        # Call shared implementation
+        return self._stream_delta_files(
+            resource_id=drive_id,
+            resource_type='drives',
+            headers=headers,
+            path_prefix=drive_name,
+            delta_token=delta_token,
+            fallback_timestamp=fallback_timestamp,
+            fallback_func=fallback_func
+        )
+    
+    def _stream_delta_files(self, resource_id: str, resource_type: str, headers: Dict[str, str],
+                            path_prefix: str = "", delta_token: Optional[str] = None,
+                            fallback_timestamp: Optional[str] = None,
+                            fallback_func=None):
+        """Stream files using Delta API with timestamp fallback (shared by OneDrive and SharePoint).
         
         Hybrid approach:
         1. Try delta token first (fast - only changed files)
         2. If delta token expired (HTTP 410), fall back to recursive scan with timestamp filtering
         
         Args:
-            user_id: User ID
+            resource_id: Resource ID (user_id or drive_id)
+            resource_type: Type of resource ('users' or 'drives')
             headers: Authentication headers
-            user_prefix: User prefix for paths
+            path_prefix: Prefix to add to file paths
             delta_token: Delta link from previous sync (None for initial sync)
             fallback_timestamp: ISO timestamp for fallback filtering if delta token expires
+            fallback_func: Fallback function to call if delta expires
             
         Yields:
             File information dictionaries, and a final dict with '_delta_token' key containing
@@ -958,15 +1024,14 @@ class BackupManager:
             # Use delta token if available, otherwise start fresh
             if delta_token:
                 endpoint = delta_token
-                logger.info(f"🔄 Using delta API for incremental sync (user: {user_id[:8]}...)")
+                logger.info(f"🔄 Using delta API for incremental sync ({resource_type}: {resource_id[:8]}...)")
             else:
-                endpoint = f'https://graph.microsoft.com/v1.0/users/{user_id}/drive/root/delta'
-                logger.info(f"📦 Using delta API for initial sync (user: {user_id[:8]}...)")
+                endpoint = f'https://graph.microsoft.com/v1.0/{resource_type}/{resource_id}/drive/root/delta'
+                logger.info(f"📦 Using delta API for initial sync ({resource_type}: {resource_id[:8]}...)")
             
             files_found = 0
             
             while endpoint:
-                logger.info(f"Fetching delta page: {endpoint}")
                 # Refresh headers before each request to ensure fresh token
                 token = self.microsoft_auth.get_access_token()
                 headers = {
@@ -974,11 +1039,10 @@ class BackupManager:
                     'Content-Type': 'application/json'
                 }
                 response = requests.get(endpoint, headers=headers)
-                logger.info(f"got response: {response.status_code}...")
                 
                 # Handle 429 errors by implementing exponential backoff
                 if response.status_code == 429:
-                    logger.warning(f"⚠️ Rate limit exceeded for user {user_id[:8]}...")
+                    logger.warning(f"⚠️ Rate limit exceeded for {resource_type} {resource_id[:8]}...")
                     retry_delay = 1  # Start with 1 second
                     max_retries = 5
                     for retry in range(max_retries):
@@ -989,7 +1053,7 @@ class BackupManager:
                             break
                         retry_delay *= 2  # Exponential backoff
                     else:
-                        logger.error(f"❌ Rate limit exceeded after {max_retries} retries for {file_path}")
+                        logger.error(f"❌ Rate limit exceeded after {max_retries} retries")
                 # Handle 401 errors by forcing token refresh and retrying
                 if response.status_code == 401:    
                     logger.info(f"🔄 Token expired, refreshing and retrying delta request...")
@@ -1001,25 +1065,22 @@ class BackupManager:
                     response = requests.get(endpoint, headers=headers)
                     
                 # Handle delta token expiration
-                if response.status_code == 410 :
-                    logger.warning(f"⚠️ Delta token expired for user {user_id[:8]}...")
+                if response.status_code == 410:
+                    logger.warning(f"⚠️ Delta token expired for {resource_type} {resource_id[:8]}...")
                     
                     # Fall back to timestamp-based filtering if available
-                    if fallback_timestamp:
+                    if fallback_timestamp and fallback_func:
                         try:
                             fallback_dt = date_parser.parse(fallback_timestamp)
                             logger.info(f"📅 Falling back to timestamp filter: files modified after {fallback_timestamp}")
                             
-                            # Use recursive method with timestamp filtering
-                            for file_info in self._stream_onedrive_files_recursive(
-                                user_id, headers, folder_id='root', user_prefix=user_prefix,
-                                modified_after=fallback_dt
-                            ):
+                            # Use provided fallback function with timestamp filtering
+                            for file_info in fallback_func(modified_after=fallback_dt):
                                 yield file_info
                             
                             # Start fresh delta sync for next time
                             logger.info(f"🔄 Initiating fresh delta sync to get new token...")
-                            fresh_endpoint = f'https://graph.microsoft.com/v1.0/users/{user_id}/drive/root/delta'
+                            fresh_endpoint = f'https://graph.microsoft.com/v1.0/{resource_type}/{resource_id}/drive/root/delta'
                             fresh_response = requests.get(fresh_endpoint, headers=headers)
                             
                             if fresh_response.status_code == 200:
@@ -1046,7 +1107,7 @@ class BackupManager:
                             # Fall through to fresh sync below
                     
                     # If no fallback timestamp or it failed, start completely fresh
-                    endpoint = f'https://graph.microsoft.com/v1.0/users/{user_id}/drive/root/delta'
+                    endpoint = f'https://graph.microsoft.com/v1.0/{resource_type}/{resource_id}/drive/root/delta'
                     logger.info(f"📦 Restarting with fresh delta sync (no fallback available)")
                     continue
                 
@@ -1056,7 +1117,7 @@ class BackupManager:
                 
                 data = response.json()
                 items = data.get('value', [])
-                logger.info(f"Value {len(items)} items")
+                
                 # Process items
                 for item in items:
                     # Skip deleted items
@@ -1078,10 +1139,16 @@ class BackupManager:
                         parent_ref = item.get('parentReference', {})
                         parent_path = parent_ref.get('path', '').replace('/drive/root:', '').strip('/')
                         
-                        if parent_path:
-                            full_path = f"{user_prefix}/{parent_path}/{name}"
+                        if path_prefix:
+                            if parent_path:
+                                full_path = f"{path_prefix}/{parent_path}/{name}"
+                            else:
+                                full_path = f"{path_prefix}/{name}"
                         else:
-                            full_path = f"{user_prefix}/{name}"
+                            if parent_path:
+                                full_path = f"{parent_path}/{name}"
+                            else:
+                                full_path = name
                         
                         # Get download URL - Delta API should include it, but construct if missing
                         download_url = item.get('@microsoft.graph.downloadUrl', '')
@@ -1089,7 +1156,7 @@ class BackupManager:
                         # If no download URL in delta response, construct the download endpoint
                         # This uses the /content endpoint which returns the file content directly
                         if not download_url and item_id:
-                            # Get driveId from parentReference or construct from user_id
+                            # Get driveId from parentReference
                             parent_ref = item.get('parentReference', {})
                             drive_id = parent_ref.get('driveId', '')
                             
@@ -1097,8 +1164,8 @@ class BackupManager:
                                 # Construct download URL: /drives/{driveId}/items/{itemId}/content
                                 download_url = f'https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content'
                             else:
-                                # Fallback: use user's drive endpoint
-                                download_url = f'https://graph.microsoft.com/v1.0/users/{user_id}/drive/items/{item_id}/content'
+                                # Fallback: construct based on resource type
+                                download_url = f'https://graph.microsoft.com/v1.0/{resource_type}/{resource_id}/drive/items/{item_id}/content'
                             
                             logger.debug(f"Constructed download URL for {name}: {download_url}")
                         
@@ -1118,6 +1185,8 @@ class BackupManager:
                 
                 if next_link:
                     # More pages to fetch
+                    # NOTE: nextLink URLs expire quickly (15-30 min) so they're not useful for
+                    # long-term crash recovery. We'll only save the final deltaLink.
                     endpoint = next_link
                 elif delta_link:
                     # No more pages, save delta link for next sync
@@ -1244,182 +1313,6 @@ class BackupManager:
         
         except Exception as e:
             logger.error(f"Error listing OneDrive folder for user {user_id}: {e}")
-    
-    def _stream_sharepoint_files_delta(self, drive_id: str, headers: Dict[str, str],
-                                             drive_name: str = "", delta_token: Optional[str] = None,
-                                             fallback_timestamp: Optional[str] = None):
-        """Stream files from SharePoint using Delta API with timestamp fallback.
-        
-        Hybrid approach:
-        1. Try delta token first (fast - only changed files)
-        2. If delta token expired (HTTP 410), fall back to recursive scan with timestamp filtering
-        
-        Args:
-            drive_id: Drive ID
-            headers: Authentication headers
-            drive_name: Drive name for path construction
-            delta_token: Delta link from previous sync (None for initial sync)
-            fallback_timestamp: ISO timestamp for fallback filtering if delta token expires
-            
-        Yields:
-            File information dictionaries, and a final dict with '_delta_token' key containing
-            the new delta link for the next sync
-        """
-        import requests
-        from dateutil import parser as date_parser
-        
-        try:
-            # Use delta token if available, otherwise start fresh
-            if delta_token:
-                endpoint = delta_token
-                logger.info(f"🔄 Using delta API for incremental sync (drive: {drive_name})")
-            else:
-                endpoint = f'https://graph.microsoft.com/v1.0/drives/{drive_id}/root/delta'
-                logger.info(f"📦 Using delta API for initial sync (drive: {drive_name})")
-            
-            files_found = 0
-            
-            while endpoint:
-                # Refresh headers before each request to ensure fresh token
-                token = self.microsoft_auth.get_access_token()
-                headers = {
-                    'Authorization': f'Bearer {token}',
-                    'Content-Type': 'application/json'
-                }
-                
-                response = requests.get(endpoint, headers=headers)
-                
-                # Handle 401 errors by forcing token refresh and retrying
-                if response.status_code == 401:
-                    logger.info(f"🔄 Token expired, refreshing and retrying delta request...")
-                    token = self.microsoft_auth.get_access_token(force_refresh=True)
-                    headers = {
-                        'Authorization': f'Bearer {token}',
-                        'Content-Type': 'application/json'
-                    }
-                    response = requests.get(endpoint, headers=headers)
-                
-                # Handle delta token expiration
-                if response.status_code == 410:
-                    logger.warning(f"⚠️ Delta token expired for drive {drive_name}")
-                    
-                    # Fall back to timestamp-based filtering if available
-                    if fallback_timestamp:
-                        try:
-                            fallback_dt = date_parser.parse(fallback_timestamp)
-                            logger.info(f"📅 Falling back to timestamp filter: files modified after {fallback_timestamp}")
-                            
-                            # Use recursive method with timestamp filtering
-                            for file_info in self._stream_sharepoint_files_recursive(
-                                drive_id, headers, folder_id='root', path="",
-                                modified_after=fallback_dt
-                            ):
-                                yield file_info
-                            
-                            # Start fresh delta sync for next time
-                            logger.info(f"🔄 Initiating fresh delta sync to get new token...")
-                            fresh_endpoint = f'https://graph.microsoft.com/v1.0/drives/{drive_id}/root/delta'
-                            fresh_response = requests.get(fresh_endpoint, headers=headers)
-                            
-                            if fresh_response.status_code == 200:
-                                fresh_data = fresh_response.json()
-                                # Navigate through all pages to get the final delta link
-                                while True:
-                                    next_link = fresh_data.get('@odata.nextLink')
-                                    delta_link = fresh_data.get('@odata.deltaLink')
-                                    
-                                    if delta_link:
-                                        yield {'_delta_token': delta_link}
-                                        break
-                                    elif next_link:
-                                        fresh_response = requests.get(next_link, headers=headers)
-                                        fresh_data = fresh_response.json()
-                                    else:
-                                        break
-                            
-                            return
-                            
-                        except Exception as e:
-                            logger.error(f"Failed to use timestamp fallback: {e}")
-                            logger.info(f"📦 Starting complete fresh delta sync...")
-                    
-                    # If no fallback timestamp or it failed, start completely fresh
-                    endpoint = f'https://graph.microsoft.com/v1.0/drives/{drive_id}/root/delta'
-                    logger.info(f"📦 Restarting with fresh delta sync (no fallback available)")
-                    continue
-                
-                elif response.status_code != 200:
-                    logger.error(f"Delta API error: HTTP {response.status_code}")
-                    break
-                
-                data = response.json()
-                items = data.get('value', [])
-                
-                # Process items
-                for item in items:
-                    # Skip deleted items
-                    if item.get('deleted'):
-                        logger.debug(f"Skipping deleted item: {item.get('name', 'unknown')}")
-                        continue
-                    
-                    # Skip folders (we only backup files)
-                    if item.get('folder'):
-                        continue
-                    
-                    # Only yield files (not folders)
-                    if item.get('file'):
-                        files_found += 1
-                        name = item.get('name', '')
-                        item_id = item.get('id', '')
-                        
-                        # Build path from parentReference
-                        parent_ref = item.get('parentReference', {})
-                        parent_path = parent_ref.get('path', '').replace('/drive/root:', '').strip('/')
-                        
-                        if parent_path:
-                            full_path = f"{parent_path}/{name}"
-                        else:
-                            full_path = name
-                        
-                        # Get download URL - Delta API should include it, but construct if missing
-                        download_url = item.get('@microsoft.graph.downloadUrl', '')
-                        
-                        # If no download URL in delta response, construct the download endpoint
-                        # This uses the /content endpoint which returns the file content directly
-                        if not download_url and item_id:
-                            # Construct download URL: /drives/{driveId}/items/{itemId}/content
-                            download_url = f'https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content'
-                            logger.debug(f"Constructed download URL for {name}: {download_url}")
-                        
-                        yield {
-                            'id': item_id,
-                            'name': name,
-                            'path': full_path,
-                            'size': item.get('size', 0),
-                            'lastModifiedDateTime': item.get('lastModifiedDateTime', ''),
-                            'mimeType': item.get('file', {}).get('mimeType', 'application/octet-stream'),
-                            '@microsoft.graph.downloadUrl': download_url
-                        }
-                
-                # Check for next page or delta link
-                next_link = data.get('@odata.nextLink')
-                delta_link = data.get('@odata.deltaLink')
-                
-                if next_link:
-                    # More pages to fetch
-                    endpoint = next_link
-                elif delta_link:
-                    # No more pages, save delta link for next sync
-                    logger.info(f"✅ Delta sync complete: {files_found} files found")
-                    # Yield the delta token as a special marker
-                    yield {'_delta_token': delta_link}
-                    break
-                else:
-                    # No more data
-                    break
-                    
-        except Exception as e:
-            logger.error(f"Error in SharePoint delta API streaming: {e}")
     
     def _stream_sharepoint_files_recursive(self, drive_id: str, headers: Dict[str, str],
                                                  folder_id: str = "root", path: str = "", 
