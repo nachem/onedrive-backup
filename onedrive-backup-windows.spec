@@ -1,13 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec file for windows
 
+import sys
+sys.path.insert(0, 'src')
+
 block_cipher = None
 
 a = Analysis(
-    ['src/onedrive_backup/cli.py'],
-    pathex=[],
+    ['run_cli.py'],
+    pathex=['src'],
     binaries=[],
     datas=[
+        ('src/onedrive_backup', 'onedrive_backup'),
         ('config/config.yaml', 'config'),
         ('config/credentials.yaml.template', 'config'),
         ('README.md', '.'),

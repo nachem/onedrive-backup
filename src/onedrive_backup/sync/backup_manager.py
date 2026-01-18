@@ -1565,6 +1565,7 @@ class BackupManager:
                         Bucket=destination_config.bucket,
                         Key=s3_key,
                         ExtraArgs={
+                            'StorageClass': 'GLACIER_IR',
                             'ContentType': content_type,
                             'Metadata': {
                                 'original-path-encoded': encoded_path,
@@ -1587,6 +1588,7 @@ class BackupManager:
                             Key=s3_key,
                             ExtraArgs={
                                 'ContentType': content_type,
+                                'StorageClass': 'GLACIER_IR',
                                 'Metadata': {
                                     'original-path-encoded': encoded_path,
                                     'source': 'onedrive-backup',
