@@ -3,6 +3,7 @@
 Entry point wrapper for OneDrive Backup CLI.
 This script ensures the package is properly imported before running the CLI.
 """
+import ssl  # noqa: F401 - force PyInstaller to include stdlib ssl/_ssl artifacts
 import sys
 from pathlib import Path
 
