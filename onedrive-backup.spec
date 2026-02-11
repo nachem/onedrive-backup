@@ -54,7 +54,8 @@ a = Analysis(
         'datetime',
         'json',
         'tempfile',
-        'hashlib'
+        'hashlib',
+        'jmespath'
     ],
     hookspath=[],
     hooksconfig={},

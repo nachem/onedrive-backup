@@ -51,7 +51,7 @@ async def main():
         
         # Load credentials (may not exist yet)
         if credentials_path.exists():
-            creds_config = CredentialsConfig.from_yaml(credentials_path)
+            creds_config = CredentialsConfig.read_credentials(backup_config.model_config)
             print("✅ Loaded credentials configuration")
         else:
             print("⚠️  Credentials file not found - using environment variables")

@@ -8,12 +8,9 @@ from pathlib import Path
 import click
 from rich import print as rprint
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
-from .auth.microsoft_auth import MicrosoftGraphAuth
 from .config.settings import BackupConfig, CredentialsConfig
-from .sources.onedrive_operations import OneDriveFileManager
 from .sync.backup_manager import BackupManager
 
 # Force UTF-8 encoding for Windows console to handle Unicode characters
@@ -40,8 +37,7 @@ def cli():
               default=Path('config/config.yaml'),
               help='Path to configuration file')
 @click.option('--credentials',
-              type=click.Path(exists=True, path_type=Path),
-              default=Path('config/credentials.yaml'),
+              default='config/credentials.yaml',
               help='Path to credentials file')
 @click.option('--job', '-j',
               help='Run specific job by name (default: run all enabled jobs)')
@@ -51,10 +47,11 @@ def cli():
 def backup(config: Path, credentials: Path, job: str, dry_run: bool):
     """Run backup jobs."""
     try:
+        print("🚀 Starting OneDrive/SharePoint Backup")
         # Load configuration
         with console.status("Loading configuration..."):
             backup_config = BackupConfig.from_yaml(config)
-            creds_config = CredentialsConfig.from_yaml(credentials)
+            creds_config = CredentialsConfig.read_credentials(backup_config)
         
         console.print(f"✅ Configuration loaded from {config}", style="green")
         
@@ -151,15 +148,14 @@ def _display_backup_results(results, backup_manager):
               default=Path('config/config.yaml'),
               help='Path to configuration file')
 @click.option('--credentials',
-              type=click.Path(exists=True, path_type=Path),
-              default=Path('config/credentials.yaml'),
+              default='config/credentials.yaml',
               help='Path to credentials file')
 def test(config: Path, credentials: Path):
     """Test connections to all configured services."""
     try:
         # Load configuration
         backup_config = BackupConfig.from_yaml(config)
-        creds_config = CredentialsConfig.from_yaml(credentials)
+        creds_config = CredentialsConfig.read_credentials(backup_config)
         
         # Initialize backup manager
         backup_manager = BackupManager(backup_config)
@@ -253,162 +249,6 @@ def init(config: Path):
     console.print("2. Create credentials.yaml with your authentication details")
     console.print("3. Run 'onedrive-backup test' to verify connections")
     console.print("4. Run 'onedrive-backup backup' to start backing up")
-
-@cli.command('list-onedrive-files')
-@click.option('--credentials',
-              type=click.Path(exists=True, path_type=Path),
-              default=Path('config/credentials.yaml'),
-              help='Path to credentials file')
-@click.option('--user', '-u',
-              help='User email or ID to list files for')
-@click.option('--recursive', '-r',
-              is_flag=True,
-              help='List files recursively in subdirectories')
-@click.option('--format', '-f',
-              type=click.Choice(['table', 'tree']),
-              default='table',
-              help='Output format')
-@click.option('--limit',
-              type=int,
-              default=100,
-              help='Maximum number of files to display')
-def list_onedrive_files(credentials: Path, user: str, recursive: bool, format: str, limit: int):
-    """List files in a user's OneDrive."""
-    try:
-        # Load credentials
-        with console.status("Loading credentials..."):
-            creds_config = CredentialsConfig.from_yaml(credentials)
-        
-        # Initialize authentication
-        auth = MicrosoftGraphAuth(
-            app_id=creds_config.microsoft_app_id,
-            app_secret=creds_config.microsoft_app_secret,
-            tenant_id=creds_config.microsoft_tenant_id
-        )
-        
-        # Initialize OneDrive manager
-        onedrive_manager = OneDriveFileManager(auth)
-        
-        # If no user specified, list users first
-        if not user:
-            console.print("🔍 No user specified. Listing available users...\n")
-            
-            with console.status("Getting organization users..."):
-                users = onedrive_manager.get_users(limit=50)
-            
-            if not users:
-                console.print("❌ No users found. Check your permissions.", style="red")
-                return
-            
-            onedrive_manager.display_users_table(users)
-            
-            console.print(f"\n💡 To list files for a specific user, use:")
-            console.print(f"   onedrive-backup list-onedrive-files --user <email-or-id>")
-            return
-        
-        # Find user by email or ID
-        console.print(f"🔍 Looking for user: {user}")
-        
-        users = onedrive_manager.get_users(limit=100)
-        target_user = None
-        
-        for u in users:
-            if user.lower() in u['email'].lower() or user == u['id'] or user.lower() in u['name'].lower():
-                target_user = u
-                break
-        
-        if not target_user:
-            console.print(f"❌ User '{user}' not found", style="red")
-            console.print("Available users:")
-            onedrive_manager.display_users_table(users[:10])
-            return
-        
-        # Get OneDrive info
-        with console.status("Getting OneDrive information..."):
-            drive_info = onedrive_manager.get_user_onedrive_info(target_user['id'])
-        
-        # Display user and OneDrive info
-        onedrive_manager.display_onedrive_info(target_user, drive_info)
-        
-        if not drive_info:
-            console.print("\n❌ User does not have an accessible OneDrive", style="red")
-            return
-        
-        # List files
-        console.print(f"\n🔍 Listing files{'(recursive)' if recursive else ''}...")
-        
-        with console.status("Getting file list..."):
-            files = onedrive_manager.list_files(
-                target_user['id'], 
-                folder_id="root", 
-                recursive=recursive, 
-                max_depth=3 if recursive else 1
-            )
-        
-        # Limit results if specified
-        if limit and len(files) > limit:
-            files = files[:limit]
-            console.print(f"⚠️ Showing first {limit} files (use --limit to change)", style="yellow")
-        
-        # Display files
-        if format == 'tree' and recursive:
-            onedrive_manager.display_files_tree(files)
-        else:
-            onedrive_manager.display_files_table(files)
-        
-    except Exception as e:
-        console.print(f"❌ Error: {e}", style="red bold")
-        import traceback
-        console.print(traceback.format_exc(), style="dim")
-        sys.exit(1)
-
-@cli.command()
-@click.option('--config', '-c',
-              type=click.Path(exists=True, path_type=Path),
-              default=Path('config/config.yaml'),
-              help='Path to configuration file')
-def status(config: Path):
-    """Show configuration status and scheduled jobs."""
-    try:
-        backup_config = BackupConfig.from_yaml(config)
-        
-        # Show sources
-        console.print("📁 [bold]Configured Sources:[/bold]")
-        for source in backup_config.sources:
-            rprint(f"   • {source.name} ({source.type})")
-        
-        # Show destinations
-        console.print("\n☁️ [bold]Configured Destinations:[/bold]")
-        for dest in backup_config.destinations:
-            rprint(f"   • {dest.name} ({dest.type})")
-        
-        # Show jobs
-        console.print("\n📋 [bold]Backup Jobs:[/bold]")
-        table = Table()
-        table.add_column("Job Name", style="cyan")
-        table.add_column("Sources")
-        table.add_column("Destination", style="magenta")
-        table.add_column("Schedule")
-        table.add_column("Status", style="green")
-        
-        for job in backup_config.backup_jobs:
-            status = "✅ Enabled" if job.enabled else "❌ Disabled"
-            schedule = job.schedule or "Manual"
-            sources = ", ".join(job.sources)
-            
-            table.add_row(
-                job.name,
-                sources,
-                job.destination,
-                schedule,
-                status
-            )
-        
-        console.print(table)
-        
-    except Exception as e:
-        console.print(f"❌ Error: {e}", style="red bold")
-        sys.exit(1)
 
 def _format_bytes(bytes_size: int) -> str:
     """Format bytes as human readable string."""
