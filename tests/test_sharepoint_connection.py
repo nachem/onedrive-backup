@@ -6,17 +6,20 @@ This test verifies the Microsoft Graph authentication and SharePoint connectivit
 using the real credentials provided by the user.
 """
 
-import sys
 import asyncio
+import sys
 from pathlib import Path
 
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import json
+
+import requests
+
 from onedrive_backup.auth.microsoft_auth import MicrosoftGraphAuth
 from onedrive_backup.config.settings import CredentialsConfig
-import requests
-import json
+
 
 async def test_sharepoint_connection():
     """Test SharePoint connection with real credentials."""

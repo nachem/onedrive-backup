@@ -6,18 +6,21 @@ This script tests connectivity to both AWS S3 and Azure Blob Storage
 to verify backup destinations are accessible.
 """
 
-import sys
 import asyncio
+import sys
 from pathlib import Path
 
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from onedrive_backup.config.settings import CredentialsConfig
-import boto3
-from azure.storage.blob import BlobServiceClient
-import requests
 from datetime import datetime
+
+import boto3
+import requests
+from azure.storage.blob import BlobServiceClient
+
+from onedrive_backup.config.settings import CredentialsConfig
+
 
 def test_aws_s3_connection(aws_access_key_id, aws_secret_access_key, bucket_name="test-bucket", region="us-east-1"):
     """Test AWS S3 connection."""
