@@ -1,4 +1,34 @@
-logs/
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.conda/
+.venv/
+venv/
+
+# Build / distribution artifacts
 build/
+dist/
+
+# Logs
+logs/
+*.log
+
+# Runtime data (contains private file paths / PII)
+data/
+
+# Secrets and real configuration (ship only *.template files)
 config/credentials.yaml
+config/config.yaml
+
+# Local AWS / infra files with account-specific identifiers
+task-definition.json
+budget.json
+filtered_budget.json
+notifications.json
+scheduler-trust.json
+trust-policy.json
+
+# Editor
+.vscode/
